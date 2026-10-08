@@ -60,8 +60,14 @@ anywhere.
 <cache-root>/                        default: /var/lib/ate/image-cache
   version                            layout version marker ("1")
   layers/sha256/<diffid-hex>/
-      fs/                            the unpacked layer tree (an overlay lowerdir)
-      whiteouts.json                 whiteout state recorded at unpack time
+      fs/                            the unpacked layer tree (for consumers
+                                     asking Form{})
+      layer.erofs                    the layer as an EROFS image (for consumers
+                                     asking Form{EROFS: true}); a layer may
+                                     hold both forms
+      layer.erofs.sha256             its digest, checked at micro-VM restore
+      whiteouts.json                 whiteout and implicit-dir metadata
+                                     recorded at unpack time
       finalized                      marker written by FinalizeLayer (consumer side)
       size                           byte count recorded at unpack (lazily
                                      backfilled for older layers), so sizing
@@ -74,8 +80,10 @@ anywhere.
                                      last-use timestamp
 ```
 
-A layer directory that exists is always complete: unpack streams into a
-`.tmp-*` sibling and moves it into place with a single atomic rename.
+A layer directory that exists holds at least one complete form: unpack
+streams into a `.tmp-*` sibling and moves it into place with a single atomic
+rename, and a second form is built into a `.fs.tmp-*` or `.layer.erofs.tmp-*`
+inside the directory and renamed in the same way.
 Startup recovery (`New`) sweeps leftover `.tmp-*` and `.rm-*` dirs,
 verifies the layout version, and reclaims orphaned layers (see Garbage
 collection below). An "image" is nothing but a manifest record listing
@@ -107,6 +115,36 @@ layer diffIDs in order — layers shared by N images exist once.
    materialize.
 5. **Record**: the image config + diffID list is written under the
    requested digest (and the per-platform child digest for multi-arch refs).
+
+The consumer picks the layer form (`Store.EnsureImageAs` with a `Form`).
+`Form{}` is the `fs/` tree above. `Form{EROFS: true}` makes unpack write a
+reproducible, 2 MiB-aligned `layer.erofs` (4 KiB blocks, uncompressed, for a
+guest to mount over virtio-pmem with DAX) and its `layer.erofs.sha256` digest
+via `buildLayerEROFS` (`github.com/erofs/go-erofs`) instead. Whiteouts,
+opaque markers, ownership, modes, mtimes, and non-overlay xattrs are written
+directly into the EROFS image, so the build needs no privilege. The image is
+built from the layer tar by atelet and never taken from an image, template or
+request. `Form.MaxEROFSLayers` falls back to `fs/` for an image with more
+distinct layers than a VM can attach as devices; `Image.EROFS` and
+`OverlaySpec.EROFS` report the form delivered.
+
+A layer the pool holds in the other form gets the requested one built beside
+it from a re-downloaded blob: `fs/` layers gain `layer.erofs`, and
+`layer.erofs` layers gain `fs/` (with `whiteouts.json` rewritten, since the
+image build records only implicit directories). Nothing in the pool ever has
+to be wiped to change a consumer's form.
+
+The bytes of `layer.erofs` are part of a snapshot's contract. A consumer
+that records the digest next to a memory snapshot (the micro-VM worker does,
+in `erofs-layers.json`) refuses to restore it over a layer whose digest
+differs, because the restored guest maps the image by offset (DAX), so a
+different layout under it would corrupt the processes it resumes.
+The digest is a function of the layer's diffID and of the `go-erofs` version
+that built it, so bumping `go-erofs` to a release that changes the image
+layout makes every existing memory snapshot unrestorable on a node that
+rebuilds the layer (a wiped cache or a node that joins later). Treat a
+`go-erofs` bump as a snapshot format change: pin it deliberately, and expect
+golden snapshots to be regenerated after one.
 
 `prepareOCIDirectory` in atelet then writes `rootfs-overlay.json`
 (`OverlaySpec`) into the bundle, listing the layer

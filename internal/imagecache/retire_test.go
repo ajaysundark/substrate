@@ -17,6 +17,7 @@ package imagecache
 import (
 	"archive/tar"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -199,5 +200,55 @@ func TestRetireLayerVsEnsureImageRace(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(img.LayerDirs[0], layerFSDirName)); err != nil {
 		t.Errorf("final layer dir missing: %v", err)
+	}
+}
+
+// A form backfill interrupted by a crash leaves its temp tree or file inside
+// a live layer dir; the startup sweep removes those and nothing else there.
+func TestSweepRemovesInLayerBackfillTemps(t *testing.T) {
+	root := t.TempDir()
+	store, err := New(root)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	layer := filepath.Join(store.layersDir(), strings.Repeat("ab", 32))
+	keep := []string{
+		filepath.Join(layer, layerFSDirName, "etc"),
+		filepath.Join(layer, layerEROFSFileName),
+		filepath.Join(layer, layerWhiteoutsFileName),
+		filepath.Join(layer, ".hidden-but-not-temp"),
+	}
+	sweep := []string{
+		filepath.Join(layer, "."+layerFSDirName+".tmp-123", "etc"),
+		filepath.Join(layer, "."+layerEROFSFileName+".tmp-456"),
+		filepath.Join(layer, "."+layerWhiteoutsFileName+".tmp-789"),
+	}
+	for _, p := range append(keep, sweep...) {
+		if strings.HasSuffix(p, "etc") {
+			if err := os.MkdirAll(p, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := New(root); err != nil {
+		t.Fatalf("New (recovery): %v", err)
+	}
+	for _, p := range keep {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("startup sweep removed %q: %v", p, err)
+		}
+	}
+	for _, p := range sweep {
+		if _, err := os.Stat(filepath.Clean(strings.TrimSuffix(p, "/etc"))); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("startup sweep left backfill temp %q: %v", p, err)
+		}
 	}
 }

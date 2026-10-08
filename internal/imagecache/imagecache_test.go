@@ -18,7 +18,9 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"errors"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -26,10 +28,12 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	erofs "github.com/erofs/go-erofs"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/registry"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
@@ -378,5 +382,298 @@ func TestRewriteLocalRegistry(t *testing.T) {
 				t.Errorf("rewriteLocalRegistry(%q) = %q; want %q", tt.ref, got, tt.want)
 			}
 		})
+	}
+}
+
+// newBlobCountingRegistry is newTestRegistry with a counter of blob GETs, to
+// prove what a pull did and did not download.
+func newBlobCountingRegistry(t *testing.T) (host string, blobs *atomic.Int32) {
+	t.Helper()
+	blobs = new(atomic.Int32)
+	inner := registry.New(registry.Logger(log.New(io.Discard, "", 0)))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/blobs/") {
+			blobs.Add(1)
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("parsing registry URL: %v", err)
+	}
+	return u.Host, blobs
+}
+
+func TestEnsureImage_EROFSLayers(t *testing.T) {
+	_, host := newTestRegistry(t)
+	ref := host + "/test/erofs:latest"
+	base := layerFromEntries(t, []tarEntry{
+		{name: "bin/", typeflag: tar.TypeDir},
+		{name: "bin/sh", typeflag: tar.TypeReg, mode: 0o755, body: strings.Repeat("s", 9000)},
+	})
+	top := layerFromEntries(t, []tarEntry{
+		{name: "app/", typeflag: tar.TypeDir},
+		{name: "app/main", typeflag: tar.TypeReg, mode: 0o755, body: "main"},
+		{name: "bin/.wh.sh", typeflag: tar.TypeReg},
+	})
+	pushImage(t, ref, v1.Config{}, base, top)
+	ctx := context.Background()
+
+	// Without the option nothing changes: no image, no flag.
+	plain := newTestStore(t)
+	img, err := plain.EnsureImage(ctx, ref)
+	if err != nil {
+		t.Fatalf("EnsureImage (plain): %v", err)
+	}
+	if img.EROFS {
+		t.Error("plain store reported EROFS")
+	}
+	if _, err := os.Stat(LayerEROFSPath(img.LayerDirs[0])); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("plain store wrote %s: %v", layerEROFSFileName, err)
+	}
+
+	store := newTestStore(t)
+	img, err = store.EnsureImageAs(ctx, ref, Form{EROFS: true})
+	if err != nil {
+		t.Fatalf("EnsureImageAs: %v", err)
+	}
+	if !img.EROFS {
+		t.Error("EROFS = false, want true")
+	}
+	for i, dir := range img.LayerDirs {
+		f, err := os.Open(LayerEROFSPath(dir))
+		if err != nil {
+			t.Fatalf("layer %d: %v", i, err)
+		}
+		defer f.Close()
+		fi, err := f.Stat()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Size()%erofsImageAlign != 0 {
+			t.Errorf("layer %d image size %d not a multiple of %d", i, fi.Size(), erofsImageAlign)
+		}
+		fsys, err := erofs.Open(f)
+		if err != nil {
+			t.Fatalf("layer %d: erofs.Open: %v", i, err)
+		}
+		switch i {
+		case 0:
+			if got, err := fs.ReadFile(fsys, "bin/sh"); err != nil || len(got) != 9000 {
+				t.Errorf("layer 0 bin/sh: len=%d err=%v", len(got), err)
+			}
+		case 1:
+			if got, err := fs.ReadFile(fsys, "app/main"); err != nil || string(got) != "main" {
+				t.Errorf("layer 1 app/main = %q, %v", got, err)
+			}
+			if fi, err := fs.Lstat(fsys, "bin/sh"); err != nil || fi.Mode()&fs.ModeCharDevice == 0 {
+				t.Errorf("layer 1 bin/sh whiteout: %v, %v", fi, err)
+			}
+		}
+		if d, err := LayerEROFSDigest(dir); err != nil || !strings.HasPrefix(d, "sha256:") {
+			t.Errorf("layer %d digest = %q, %v", i, d, err)
+		}
+		// Only layer.erofs is written for an EROFS consumer.
+		n, ok, err := recordedLayerSize(dir)
+		if err != nil || !ok {
+			t.Fatalf("layer %d size: ok=%v err=%v", i, ok, err)
+		}
+		if n != fi.Size() {
+			t.Errorf("layer %d recorded size %d, want image size %d", i, n, fi.Size())
+		}
+		if _, err := os.Stat(filepath.Join(dir, layerFSDirName)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("layer %d fs/ should not be unpacked for an EROFS consumer: %v", i, err)
+		}
+	}
+
+	// A fresh store over the same pool hits without touching the registry.
+	store2, err := New(store.root)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	img2, err := store2.EnsureImageAs(ctx, host+"/test/erofs@"+img.Digest.String(), Form{EROFS: true})
+	if err != nil {
+		t.Fatalf("EnsureImageAs (hit): %v", err)
+	}
+	if !img2.EROFS || !slices.Equal(img2.LayerDirs, img.LayerDirs) {
+		t.Errorf("hit = %+v, want EROFS with the same layer dirs", img2)
+	}
+
+	// Over the cap the image is served as fs/, and the layers get a tree
+	// beside their images.
+	img3, err := store2.EnsureImageAs(ctx, ref, Form{EROFS: true, MaxEROFSLayers: 1})
+	if err != nil {
+		t.Fatalf("EnsureImageAs (capped): %v", err)
+	}
+	if img3.EROFS || !slices.Equal(img3.LayerDirs, img.LayerDirs) {
+		t.Errorf("capped = %+v, want fs/ over the same layer dirs", img3)
+	}
+	for i, dir := range img3.LayerDirs {
+		if !layerComplete(dir, false) || !layerComplete(dir, true) {
+			t.Errorf("layer %d should hold both forms after the capped pull", i)
+		}
+	}
+}
+
+// A pool filled by fs/ consumers has trees but no images. An EROFS consumer
+// must not be served those layers as complete; the missing image is built
+// from a re-downloaded blob while the tree stays in place.
+func TestEnsureImage_EROFSBackfill(t *testing.T) {
+	host, blobs := newBlobCountingRegistry(t)
+	ref := host + "/test/backfill:latest"
+	layer := layerFromEntries(t, []tarEntry{
+		{name: "etc/", typeflag: tar.TypeDir},
+		{name: "etc/os-release", typeflag: tar.TypeReg, body: "ID=test\n"},
+	})
+	pushImage(t, ref, v1.Config{}, layer)
+	ctx := context.Background()
+
+	plain := newTestStore(t)
+	img, err := plain.EnsureImage(ctx, ref)
+	if err != nil {
+		t.Fatalf("EnsureImage (plain): %v", err)
+	}
+	dir := img.LayerDirs[0]
+	// A temp image from an interrupted earlier attempt must be swept.
+	stale := filepath.Join(dir, "."+layerEROFSFileName+".tmp-stale")
+	if err := os.WriteFile(stale, []byte("junk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(filepath.Join(dir, layerFSDirName, "etc/os-release"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	blobs.Store(0)
+	store, err := New(plain.root)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if got, err := store.cachedImage(img.Digest, Form{EROFS: true}); err != nil || got != nil {
+		t.Fatalf("cachedImage before backfill = %v, %v; want miss", got, err)
+	}
+	img2, err := store.EnsureImageAs(ctx, ref, Form{EROFS: true})
+	if err != nil {
+		t.Fatalf("EnsureImageAs (backfill): %v", err)
+	}
+	if !img2.EROFS || img2.LayerDirs[0] != dir {
+		t.Fatalf("backfill result = %+v, want EROFS over %s", img2, dir)
+	}
+	if blobs.Load() == 0 {
+		t.Error("backfill fetched no blobs; the image cannot have come from the tar")
+	}
+	f, err := os.Open(LayerEROFSPath(dir))
+	if err != nil {
+		t.Fatalf("image after backfill: %v", err)
+	}
+	defer f.Close()
+	fsys, err := erofs.Open(f)
+	if err != nil {
+		t.Fatalf("erofs.Open: %v", err)
+	}
+	if got, err := fs.ReadFile(fsys, "etc/os-release"); err != nil || string(got) != "ID=test\n" {
+		t.Errorf("etc/os-release = %q, %v", got, err)
+	}
+	if _, err := os.Stat(stale); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("stale temp image not swept: %v", err)
+	}
+	if d, err := LayerEROFSDigest(dir); err != nil || !strings.HasPrefix(d, "sha256:") {
+		t.Errorf("digest after backfill = %q, %v", d, err)
+	}
+	after, err := os.Stat(filepath.Join(dir, layerFSDirName, "etc/os-release"))
+	if err != nil || !after.ModTime().Equal(before.ModTime()) {
+		t.Errorf("fs/ tree was rewritten by the backfill: %v, %v", after, err)
+	}
+
+	// Second pull is a plain hit: no further downloads.
+	n := blobs.Load()
+	if _, err := store.EnsureImageAs(ctx, ref, Form{EROFS: true}); err != nil {
+		t.Fatalf("EnsureImageAs (hit): %v", err)
+	}
+	if blobs.Load() != n {
+		t.Errorf("hit after backfill fetched %d more blobs", blobs.Load()-n)
+	}
+}
+
+// The reverse: a pool filled by an EROFS consumer has images but no trees.
+// An fs/ consumer gets the tree unpacked beside the image from a
+// re-downloaded blob, with whiteouts.json rewritten to carry the whiteouts
+// a host overlay materializes (the image build records only implicit
+// directories).
+func TestEnsureImage_FSBackfill(t *testing.T) {
+	host, blobs := newBlobCountingRegistry(t)
+	ref := host + "/test/fsbackfill:latest"
+	base := layerFromEntries(t, []tarEntry{
+		{name: "bin/", typeflag: tar.TypeDir},
+		{name: "bin/sh", typeflag: tar.TypeReg, body: "sh"},
+		{name: "bin/rm", typeflag: tar.TypeReg, body: "rm"},
+	})
+	top := layerFromEntries(t, []tarEntry{
+		{name: "bin/.wh.rm", typeflag: tar.TypeReg},
+		{name: "app/main", typeflag: tar.TypeReg, body: "main"},
+	})
+	pushImage(t, ref, v1.Config{}, base, top)
+	ctx := context.Background()
+
+	store := newTestStore(t)
+	img, err := store.EnsureImageAs(ctx, ref, Form{EROFS: true})
+	if err != nil {
+		t.Fatalf("EnsureImageAs: %v", err)
+	}
+	topDir := img.LayerDirs[1]
+	if wh, err := readWhiteouts(topDir); err != nil || len(wh.Whiteouts) != 0 {
+		t.Fatalf("image build recorded whiteouts %v, %v; want none (they live in the image)", wh, err)
+	}
+	stale := filepath.Join(topDir, "."+layerFSDirName+".tmp-stale")
+	if err := os.MkdirAll(stale, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	imgBefore, err := os.Stat(LayerEROFSPath(topDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	blobs.Store(0)
+	if got, err := store.cachedImage(img.Digest, Form{}); err != nil || got != nil {
+		t.Fatalf("cachedImage before backfill = %v, %v; want miss", got, err)
+	}
+	img2, err := store.EnsureImage(ctx, ref)
+	if err != nil {
+		t.Fatalf("EnsureImage (fs backfill): %v", err)
+	}
+	if img2.EROFS || !slices.Equal(img2.LayerDirs, img.LayerDirs) {
+		t.Fatalf("backfill result = %+v, want fs/ over the same layer dirs", img2)
+	}
+	if blobs.Load() == 0 {
+		t.Error("backfill fetched no blobs; the tree cannot have come from the image")
+	}
+	if got, err := os.ReadFile(filepath.Join(topDir, layerFSDirName, "app/main")); err != nil || string(got) != "main" {
+		t.Errorf("app/main = %q, %v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(topDir, layerFSDirName, "bin/.wh.rm")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("whiteout entry written into fs/: %v", err)
+	}
+	wh, err := readWhiteouts(topDir)
+	if err != nil || !slices.Equal(wh.Whiteouts, []string{"bin/rm"}) {
+		t.Errorf("whiteouts after backfill = %+v, %v; want bin/rm", wh, err)
+	}
+	if _, err := os.Stat(stale); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("stale temp tree not swept: %v", err)
+	}
+	imgAfter, err := os.Stat(LayerEROFSPath(topDir))
+	if err != nil || !imgAfter.ModTime().Equal(imgBefore.ModTime()) {
+		t.Errorf("layer.erofs was rewritten by the backfill: %v, %v", imgAfter, err)
+	}
+
+	// Both consumers now hit without downloads.
+	n := blobs.Load()
+	for _, form := range []Form{{}, {EROFS: true}} {
+		if _, err := store.EnsureImageAs(ctx, ref, form); err != nil {
+			t.Fatalf("EnsureImageAs(%+v) (hit): %v", form, err)
+		}
+	}
+	if blobs.Load() != n {
+		t.Errorf("hits after backfill fetched %d more blobs", blobs.Load()-n)
 	}
 }
