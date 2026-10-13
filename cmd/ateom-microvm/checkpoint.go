@@ -154,6 +154,15 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 		s.readFinal(ctx, hosted)
 	}
 
+	// Pre-snapshot guest reclaim: free guest pages right before vm.pause so
+	// free page reporting returns them to the host before the memory snapshot.
+	// MEMORY fidelity only (a VOLUMES snapshot carries no memory image).
+	// Best-effort: the result is logged and counted in the prep phase; it never
+	// fails the checkpoint.
+	if scope == ateompb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY && s.presnapshotReclaim != nil {
+		s.runPresnapshotReclaim(ctx, actorUID, ra)
+	}
+
 	tPause := time.Now()
 	dPrep = tPause.Sub(tStart)
 	pauseErr := client.Pause(ctx)
@@ -478,4 +487,29 @@ func (s *AteomService) terminateWorkload(ctx context.Context, actor resources.Ac
 		errs = append(errs, fmt.Errorf("while cleaning up actor network: %w", err))
 	}
 	return errors.Join(errs...)
+}
+
+// runPresnapshotReclaim runs the guest reclaim on the actor's first workload
+// container and logs the outcome.
+func (s *AteomService) runPresnapshotReclaim(ctx context.Context, actorUID string, ra *runningActor) {
+	var guestAgent *kata.AgentClient
+	var firstCtr string
+	if ra != nil {
+		guestAgent = ra.guestAgent
+		if len(ra.workloadIDs) > 0 {
+			firstCtr = ra.workloadIDs[0]
+		}
+	}
+	t := time.Now()
+	rr := kata.PreSnapshotReclaim(ctx, *s.presnapshotReclaim, guestAgent, firstCtr)
+	slog.InfoContext(ctx, "Pre-snapshot guest reclaim",
+		slog.String("id", actorUID),
+		slog.String("channel", rr.Channel),
+		slog.Bool("ok", rr.OK),
+		slog.String("err", rr.Err),
+		slog.String("attempts", rr.Attempts),
+		slog.Duration("exec_took", rr.ExecTook),
+		slog.Duration("fpr_wait", rr.WaitTook),
+		slog.Duration("took", time.Since(t)),
+		slog.String("guest_output", rr.Output))
 }

@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/compute/metadata"
+	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/kata"
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/reaper"
 	"github.com/agent-substrate/substrate/internal/actorlock"
 	"github.com/agent-substrate/substrate/internal/actorlog"
@@ -71,6 +72,13 @@ var (
 
 	guestPageReportingDelayMS = pflag.Int("guest-page-reporting-delay-ms", -1,
 		"Guest free page reporting delay in milliseconds, passed as page_reporting.delay_ms on the guest kernel command line. Negative (the default) keeps the guest kernel's built-in 2 s delay. Needs a guest kernel with the mm/page_reporting delay_ms patch; the stock kata kernel ignores it.")
+
+	presnapshotReclaim = pflag.Bool("presnapshot-reclaim", false,
+		"Before a MEMORY-fidelity checkpoint pauses the guest, drop the guest page cache, run cgroup memory.reclaim and compact memory inside the guest, then wait for free page reporting to return the freed pages to the host. Adds the wait plus the guest reclaim time to every such checkpoint. Runs through kata-agent ExecProcess on the first workload container, which needs a shell in that container.")
+	presnapshotReclaimWait = pflag.Duration("presnapshot-reclaim-wait", kata.DefaultReclaimWait,
+		"Wait between the pre-snapshot guest reclaim and vm.pause. Must cover the guest free page reporting delay (2 s on an unpatched kernel, or --guest-page-reporting-delay-ms).")
+	presnapshotReclaimTarget = pflag.String("presnapshot-reclaim-target", kata.DefaultReclaimTarget,
+		"Bytes written to each guest top-level cgroup's memory.reclaim by the pre-snapshot reclaim.")
 
 	otlpRelaySocket = pflag.String("otlp-relay-socket", nodepath.AteletOTLPSocketPath(),
 		"Unix socket of atelet's OTLP relay to export telemetry through, keeping it off the pod network. Empty, or absent at startup, exports directly to OTEL_EXPORTER_OTLP_ENDPOINT instead.")
@@ -237,6 +245,12 @@ func do(ctx context.Context) error {
 	ateomService := NewService(*podUID, *chBinary, *guestDebug, *vmmMemReserve, *maxActors, tunnel, actorLogger)
 	ateomService.actorCgroups = actorCgroups
 	ateomService.guestPageReportingDelayMS = *guestPageReportingDelayMS
+	if *presnapshotReclaim {
+		ateomService.presnapshotReclaim = &kata.ReclaimConfig{
+			Target: *presnapshotReclaimTarget,
+			Wait:   *presnapshotReclaimWait,
+		}
+	}
 	// The controller sets both from the downward API.
 	pool := ateomstats.Pool{Namespace: os.Getenv("POD_NAMESPACE"), Name: os.Getenv("WORKER_POOL_NAME")}
 	if pool.Namespace == "" || pool.Name == "" {
@@ -360,6 +374,9 @@ type AteomService struct {
 	// guestPageReportingDelayMS is the guest free page reporting delay set
 	// from --guest-page-reporting-delay-ms. Negative keeps the kernel default.
 	guestPageReportingDelayMS int
+	// presnapshotReclaim configures the guest reclaim before a MEMORY-fidelity
+	// checkpoint pauses the VM. Nil (the default) skips it.
+	presnapshotReclaim *kata.ReclaimConfig
 
 	// memReserveMiB is guest RAM (MiB) held back from the pod's memory limit for
 	// the cloud-hypervisor VMM + virtiofsd (host processes sharing the pod cgroup
