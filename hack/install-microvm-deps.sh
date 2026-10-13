@@ -22,10 +22,11 @@
 #     benchmark workload)
 #
 # On --install: assembles the asset set (assemble.sh; skipped if OUT already
-# has them), stages the assets under kata-assets/ to the cluster's object
+# has them), stages the assets under $ASSET_PREFIX/ (default kata-assets/) to the cluster's object
 # store bucket (rustfs on kind, GCS on GKE), and applies the cluster-wide
 # `microvm` SandboxConfig referencing those assets. Every asset sha256 is
-# pinned in the manifest, so the apply only substitutes the bucket name.
+# pinned in the manifest, so the apply only substitutes the bucket and the
+# asset prefix.
 #
 # ActorTemplates must reference the SandboxConfig explicitly via
 # sandboxConfig.configName: microvm. This avoids a dirty teardown silently
@@ -44,6 +45,9 @@
 #
 # Env (most come from .ate-dev-env.sh):
 #   BUCKET_NAME      object store bucket for assets/snapshots (default: ate-snapshots).
+#   ASSET_PREFIX     object prefix the assets are staged under and the
+#                    SandboxConfig points at (default: kata-assets). A custom
+#                    asset set also needs its sha256 values in the template.
 #   KUBECTL_CONTEXT  (optional) kube context; threaded into kubectl.
 #   PROJECT_ID       (optional) GCP project for the GCS asset upload (GKE path).
 #   ARCH             target arch (default: from KO_DEFAULTPLATFORMS, else host arch).
@@ -63,6 +67,7 @@ if [[ -r .ate-dev-env.sh ]] && [[ -z "${NO_DEV_ENV:-}" ]]; then
 fi
 
 BUCKET_NAME="${BUCKET_NAME:-ate-snapshots}"
+ASSET_PREFIX="${ASSET_PREFIX:-kata-assets}"
 KUBECTL_CONTEXT="${KUBECTL_CONTEXT:-}"
 ATE_INSTALL_KIND="${ATE_INSTALL_KIND:-false}"
 
@@ -157,7 +162,7 @@ if [[ "${action}" == "delete" ]]; then
     echo "       again." >&2
     exit 1
   fi
-  log "Done. (Bucket assets at ${BUCKET_SCHEME}://${BUCKET_NAME}/kata-assets/ left in place.)"
+  log "Done. (Bucket assets at ${BUCKET_SCHEME}://${BUCKET_NAME}/${ASSET_PREFIX}/ left in place.)"
   exit 0
 fi
 
@@ -204,23 +209,24 @@ else
 fi
 
 # --- 2. stage assets to rustfs (kind) / GCS (GKE) --------------------------
-# Upload the four assets under kata-assets/, where atelet fetches them: the
+# Upload the four assets under ${ASSET_PREFIX}/, where atelet fetches them: the
 # in-cluster rustfs (S3 API) on kind, or the GCS bucket on GKE.
 if [[ "${ATE_INSTALL_KIND}" == "true" ]]; then
-  log "Staging assets to in-cluster rustfs bucket ${BUCKET_NAME} (kata-assets/)..."
-  OUT="${OUT}" BUCKET="${BUCKET_NAME}" KUBECTL_CONTEXT="${KUBECTL_CONTEXT}" hack/microvm-assets/stage-to-rustfs.sh
+  log "Staging assets to in-cluster rustfs bucket ${BUCKET_NAME} (${ASSET_PREFIX}/)..."
+  OUT="${OUT}" BUCKET="${BUCKET_NAME}" ASSET_PREFIX="${ASSET_PREFIX}" KUBECTL_CONTEXT="${KUBECTL_CONTEXT}" hack/microvm-assets/stage-to-rustfs.sh
 else
-  log "Uploading assets to gs://${BUCKET_NAME}/kata-assets/ ..."
-  OUT="${OUT}" BUCKET="${BUCKET_NAME}" hack/microvm-assets/stage-to-gcs.sh
+  log "Uploading assets to gs://${BUCKET_NAME}/${ASSET_PREFIX}/ ..."
+  OUT="${OUT}" BUCKET="${BUCKET_NAME}" ASSET_PREFIX="${ASSET_PREFIX}" hack/microvm-assets/stage-to-gcs.sh
 fi
 
 # --- 3. apply the cluster-wide microvm SandboxConfig -----------------------
 # Every asset is downloaded rather than built, so all four carry committed,
-# reproducible per-arch shas and the bucket's scheme and name are the only
-# substitutions left.
+# reproducible per-arch shas and the bucket's scheme, name and asset prefix are
+# the only substitutions left.
 log "Applying microvm SandboxConfig from ${MANIFEST_TEMPLATE}..."
 sed -e "s|\${BUCKET_SCHEME}|${BUCKET_SCHEME}|g" \
     -e "s|\${BUCKET_NAME}|${BUCKET_NAME}|g" \
+    -e "s|\${ASSET_PREFIX}|${ASSET_PREFIX}|g" \
     "${MANIFEST_TEMPLATE}" \
   | run_kubectl apply -f -
 

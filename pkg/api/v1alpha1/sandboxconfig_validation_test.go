@@ -388,7 +388,7 @@ func TestShippedSandboxConfigManifests(t *testing.T) {
 			if err != nil {
 				t.Fatalf("read manifest: %v", err)
 			}
-			raw = []byte(strings.NewReplacer("${BUCKET_SCHEME}", "s3", "${BUCKET_NAME}", "test-bucket").Replace(string(raw)))
+			raw = []byte(strings.NewReplacer("${BUCKET_SCHEME}", "s3", "${BUCKET_NAME}", "test-bucket", "${ASSET_PREFIX}", "kata-assets").Replace(string(raw)))
 			sc := &SandboxConfig{}
 			if err := yaml.UnmarshalStrict(raw, sc); err != nil {
 				t.Fatalf("decode manifest: %v", err)

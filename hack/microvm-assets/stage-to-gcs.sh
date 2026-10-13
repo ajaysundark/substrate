@@ -15,15 +15,16 @@
 # limitations under the License.
 
 # Stage the assembled micro-VM asset set into the GCS snapshot bucket under
-# kata-assets/, where atelet fetches it through the node's object-store plugin
-# (per manifests/microvm/sandboxconfig-microvm.yaml.tmpl). The plugin refuses
+# $ASSET_PREFIX/ (default kata-assets/), where atelet fetches it through the
+# node's object-store plugin (per manifests/microvm/sandboxconfig-microvm.yaml.tmpl). The plugin refuses
 # assets stored under a snapshot location (<snapshotConfig.location>/atespaces/),
 # so keep them outside it. The GKE counterpart of stage-to-rustfs.sh. Run after
 # assemble.sh has produced $OUT.
 #
 # Requires the `gcloud` CLI authenticated for the bucket's project. Env: OUT (asset
 # dir, default ./bin/microvm-assets/amd64), BUCKET (default ate-snapshots),
-# PROJECT_ID (optional; passed to gcloud as --project when set).
+# ASSET_PREFIX (object prefix, default kata-assets), PROJECT_ID (optional;
+# passed to gcloud as --project when set).
 
 set -o errexit -o nounset -o pipefail
 
@@ -31,15 +32,16 @@ ROOT="$(git rev-parse --show-toplevel)"
 
 OUT="${OUT:-${ROOT}/bin/microvm-assets/amd64}"
 BUCKET="${BUCKET:-ate-snapshots}"
+ASSET_PREFIX="${ASSET_PREFIX:-kata-assets}"
 
 # Pass --project only when PROJECT_ID is set (mirrors hack/teardown.sh); otherwise
 # gcloud uses its active config project. ${PROJECT_ID:+...} elides the flag entirely
 # when unset (same idiom as KUBECTL_CONTEXT in hack/run-microvm-demo.sh).
-echo ">> Uploading assets to gs://${BUCKET}/kata-assets/ ..."
+echo ">> Uploading assets to gs://${BUCKET}/${ASSET_PREFIX}/ ..."
 for f in cloud-hypervisor virtiofsd vmlinux rootfs.img; do
   echo "   $f"
-  gcloud storage cp ${PROJECT_ID:+--project="${PROJECT_ID}"} "${OUT}/${f}" "gs://${BUCKET}/kata-assets/${f}"
+  gcloud storage cp ${PROJECT_ID:+--project="${PROJECT_ID}"} "${OUT}/${f}" "gs://${BUCKET}/${ASSET_PREFIX}/${f}"
 done
 
 echo ">> Done. Verify:"
-gcloud storage ls ${PROJECT_ID:+--project="${PROJECT_ID}"} "gs://${BUCKET}/kata-assets/"
+gcloud storage ls ${PROJECT_ID:+--project="${PROJECT_ID}"} "gs://${BUCKET}/${ASSET_PREFIX}/"

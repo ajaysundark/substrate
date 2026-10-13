@@ -15,8 +15,8 @@
 # limitations under the License.
 
 # Stage the assembled micro-VM asset set into the kind cluster's rustfs S3 bucket
-# under kata-assets/, where atelet fetches it through the node's object-store
-# plugin (per manifests/microvm/sandboxconfig-microvm.yaml.tmpl). The plugin
+# under $ASSET_PREFIX/ (default kata-assets/), where atelet fetches it through
+# the node's object-store plugin (per manifests/microvm/sandboxconfig-microvm.yaml.tmpl). The plugin
 # refuses assets stored under a snapshot location
 # (<snapshotConfig.location>/atespaces/), so keep them outside it.
 # Run after the cluster is up (hack/install-ate-kind.sh) and assemble.sh has produced $OUT.
@@ -31,8 +31,8 @@
 # all on macOS (the container's localhost is the Docker VM, not the host).
 #
 # Env: OUT (asset dir, default ./bin/microvm-assets/arm64), BUCKET (default
-# ate-snapshots), NAMESPACE (rustfs namespace, default ate-system),
-# KUBECTL_CONTEXT (optional; kube context), KIND_CLUSTER_NAME (default: derived
+# ate-snapshots), ASSET_PREFIX (object prefix, default kata-assets), NAMESPACE
+# (rustfs namespace, default ate-system), KUBECTL_CONTEXT (optional; kube context), KIND_CLUSTER_NAME (default: derived
 # from KUBECTL_CONTEXT, else "kind").
 
 set -o errexit -o nounset -o pipefail
@@ -41,6 +41,7 @@ ROOT="$(git rev-parse --show-toplevel)"
 
 OUT="${OUT:-${ROOT}/bin/microvm-assets/arm64}"
 BUCKET="${BUCKET:-ate-snapshots}"
+ASSET_PREFIX="${ASSET_PREFIX:-kata-assets}"
 NAMESPACE="${NAMESPACE:-ate-system}"
 KUBECTL_CONTEXT="${KUBECTL_CONTEXT:-}"
 # kind contexts are named kind-<cluster>; fall back to kind's own default.
@@ -81,7 +82,7 @@ if [[ -z "${NODE}" ]]; then
 fi
 ENDPOINT="http://$(run_kubectl get svc rustfs -o jsonpath='{.spec.clusterIP}'):9000"
 
-echo ">> Uploading assets to s3://${BUCKET}/kata-assets/ via ${ENDPOINT} (netns of ${NODE})..."
+echo ">> Uploading assets to s3://${BUCKET}/${ASSET_PREFIX}/ via ${ENDPOINT} (netns of ${NODE})..."
 aws_cli() {
   # -i (no -t): a TTY would corrupt the binary stream piped in on stdin.
   docker run --rm -i \
@@ -95,8 +96,8 @@ aws_cli() {
 
 for f in "${ASSETS[@]}"; do
   echo "   $f"
-  aws_cli s3 cp - "s3://${BUCKET}/kata-assets/${f}" < "${OUT}/${f}"
+  aws_cli s3 cp - "s3://${BUCKET}/${ASSET_PREFIX}/${f}" < "${OUT}/${f}"
 done
 
 echo ">> Done. Verify:"
-aws_cli s3 ls "s3://${BUCKET}/kata-assets/" < /dev/null
+aws_cli s3 ls "s3://${BUCKET}/${ASSET_PREFIX}/" < /dev/null
