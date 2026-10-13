@@ -739,6 +739,7 @@ func (s *AteomService) guestConfig() (memMiB, vcpus int, kparams string) {
 	if s.guestDebug {
 		kparams = kata.WithAgentDebug(kparams)
 	}
+	kparams = kata.WithPageReportingDelay(kparams, s.guestPageReportingDelayMS)
 	return kata.DefaultMemoryMiB, kata.DefaultVCPUs, kparams
 }
 

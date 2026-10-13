@@ -15,6 +15,7 @@
 package kata
 
 import (
+	"strconv"
 	"strings"
 )
 
@@ -32,6 +33,18 @@ const BaseKernelParams = "cgroup_no_v1=all systemd.unified_cgroup_hierarchy=1"
 // WithAgentDebug enables guest agent debug logging and the debug console on vsock 1026
 func WithAgentDebug(kernelParams string) string {
 	return appendKernelParams(kernelParams, "agent.log=", "agent.log=debug agent.debug_console agent.debug_console_vport=1026")
+}
+
+// WithPageReportingDelay sets the guest free page reporting delay to delayMS
+// milliseconds through the page_reporting.delay_ms kernel parameter. A
+// negative delayMS leaves kernelParams unchanged, so the guest kernel keeps its
+// built-in delay (2 s). The parameter needs a guest kernel that carries the
+// mm/page_reporting delay_ms patch; other kernels ignore it.
+func WithPageReportingDelay(kernelParams string, delayMS int) string {
+	if delayMS < 0 {
+		return kernelParams
+	}
+	return appendKernelParams(kernelParams, "page_reporting.delay_ms=", "page_reporting.delay_ms="+strconv.Itoa(delayMS))
 }
 
 // appendKernelParams appends add to a kernel_params string unless marker is

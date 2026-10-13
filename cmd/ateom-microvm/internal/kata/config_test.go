@@ -42,3 +42,25 @@ func TestWithAgentDebug(t *testing.T) {
 		t.Errorf("expected WithAgentDebug to be idempotent, but got %q then %q", got, again)
 	}
 }
+
+func TestWithPageReportingDelay(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		delayMS int
+		want    string
+	}{
+		{name: "unset keeps the kernel default", delayMS: -1, want: BaseKernelParams},
+		{name: "zero", delayMS: 0, want: BaseKernelParams + " page_reporting.delay_ms=0"},
+		{name: "50 ms", delayMS: 50, want: BaseKernelParams + " page_reporting.delay_ms=50"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := WithPageReportingDelay(BaseKernelParams, tc.delayMS)
+			if got != tc.want {
+				t.Errorf("WithPageReportingDelay(%q, %d) = %q, want %q", BaseKernelParams, tc.delayMS, got, tc.want)
+			}
+			if again := WithPageReportingDelay(got, tc.delayMS); again != got {
+				t.Errorf("expected WithPageReportingDelay to be idempotent, but got %q then %q", got, again)
+			}
+		})
+	}
+}

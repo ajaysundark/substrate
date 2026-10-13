@@ -226,6 +226,17 @@ func TestGuestConfigDebugConsole(t *testing.T) {
 	}
 }
 
+func TestGuestConfigPageReportingDelay(t *testing.T) {
+	svc := NewService("pod", "cloud-hypervisor", false, 0, 1, nil, nil)
+	if _, _, kparams := svc.guestConfig(); strings.Contains(kparams, "page_reporting.delay_ms") {
+		t.Errorf("expected guestConfig() with the delay unset not to set page_reporting.delay_ms, got %q", kparams)
+	}
+	svc.guestPageReportingDelayMS = 50
+	if _, _, kparams := svc.guestConfig(); !strings.Contains(kparams, "page_reporting.delay_ms=50") {
+		t.Errorf("expected guestConfig() with a 50 ms delay to contain page_reporting.delay_ms=50, got %q", kparams)
+	}
+}
+
 func TestBuildVMConfigBalloon(t *testing.T) {
 	cfg := buildVMConfig("actor-1", "/vmlinux", "/rootfs.img", "", "/console.log", 256, 1, true, false)
 	if cfg.Balloon == nil || !cfg.Balloon.FreePageReporting || cfg.Balloon.Size != 0 {

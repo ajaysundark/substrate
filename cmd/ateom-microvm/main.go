@@ -69,6 +69,9 @@ var (
 	showVersion   = pflag.Bool("version", false, "Print version and exit.")
 	logLevelFlag  = pflag.String("log-level", "info", "Minimum log level: debug, info, warn, or error.")
 
+	guestPageReportingDelayMS = pflag.Int("guest-page-reporting-delay-ms", -1,
+		"Guest free page reporting delay in milliseconds, passed as page_reporting.delay_ms on the guest kernel command line. Negative (the default) keeps the guest kernel's built-in 2 s delay. Needs a guest kernel with the mm/page_reporting delay_ms patch; the stock kata kernel ignores it.")
+
 	otlpRelaySocket = pflag.String("otlp-relay-socket", nodepath.AteletOTLPSocketPath(),
 		"Unix socket of atelet's OTLP relay to export telemetry through, keeping it off the pod network. Empty, or absent at startup, exports directly to OTEL_EXPORTER_OTLP_ENDPOINT instead.")
 
@@ -233,6 +236,7 @@ func do(ctx context.Context) error {
 	}
 	ateomService := NewService(*podUID, *chBinary, *guestDebug, *vmmMemReserve, *maxActors, tunnel, actorLogger)
 	ateomService.actorCgroups = actorCgroups
+	ateomService.guestPageReportingDelayMS = *guestPageReportingDelayMS
 	// The controller sets both from the downward API.
 	pool := ateomstats.Pool{Namespace: os.Getenv("POD_NAMESPACE"), Name: os.Getenv("WORKER_POOL_NAME")}
 	if pool.Namespace == "" || pool.Name == "" {
@@ -353,6 +357,9 @@ type AteomService struct {
 	podUID     string
 	chBinary   string
 	guestDebug bool
+	// guestPageReportingDelayMS is the guest free page reporting delay set
+	// from --guest-page-reporting-delay-ms. Negative keeps the kernel default.
+	guestPageReportingDelayMS int
 
 	// memReserveMiB is guest RAM (MiB) held back from the pod's memory limit for
 	// the cloud-hypervisor VMM + virtiofsd (host processes sharing the pod cgroup
@@ -398,6 +405,9 @@ func NewService(podUID, chBinary string, guestDebug bool, memReserveMiB, maxActo
 		memReserveMiB: memReserveMiB,
 		tunnel:        tunnel,
 		actorLogger:   actorLogger,
+
+		// Kernel default until main applies --guest-page-reporting-delay-ms.
+		guestPageReportingDelayMS: -1,
 	}
 }
 
