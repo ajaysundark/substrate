@@ -162,3 +162,44 @@ func TestSpecToAgentPB_NonPositiveCPUValuesAreDropped(t *testing.T) {
 		})
 	}
 }
+
+// The agent creates the container's pid namespace itself. A forwarded pid entry
+// gives it a second one and every ExecProcess fails "failed to join pidns:
+// EINVAL", so pid must be dropped along with the host-only namespaces.
+func TestSpecToAgentPB_Namespaces(t *testing.T) {
+	got := SpecToAgentPB(&specs.Spec{
+		Linux: &specs.Linux{
+			Namespaces: []specs.LinuxNamespace{
+				{Type: specs.PIDNamespace},
+				{Type: specs.NetworkNamespace, Path: "/proc/1/ns/net"},
+				{Type: specs.IPCNamespace, Path: "/proc/1/ns/ipc"},
+				{Type: specs.UTSNamespace},
+				{Type: specs.MountNamespace},
+				{Type: specs.CgroupNamespace},
+			},
+		},
+	})
+
+	if got.Linux == nil {
+		t.Fatal("Linux = nil, want namespaces carried through")
+	}
+	var types []string
+	for _, ns := range got.Linux.Namespaces {
+		if ns.Type == string(specs.PIDNamespace) {
+			t.Errorf("forwarded a %q namespace entry; the agent adds its own", ns.Type)
+		}
+		if ns.Path != "" {
+			t.Errorf("namespace %q has host path %q, want it emptied", ns.Type, ns.Path)
+		}
+		types = append(types, ns.Type)
+	}
+	want := []string{string(specs.IPCNamespace), string(specs.UTSNamespace), string(specs.MountNamespace)}
+	if len(types) != len(want) {
+		t.Fatalf("namespaces = %v, want %v", types, want)
+	}
+	for i := range want {
+		if types[i] != want[i] {
+			t.Errorf("namespaces[%d] = %q, want %q", i, types[i], want[i])
+		}
+	}
+}

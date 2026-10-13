@@ -108,6 +108,13 @@ func SpecToAgentPB(s *specs.Spec) *agentpb.Spec {
 			switch ns.Type {
 			case specs.NetworkNamespace, specs.CgroupNamespace, specs.TimeNamespace:
 				continue
+			case specs.PIDNamespace:
+				// Match the kata shim's handlePidNamespace: never forward the pid
+				// namespace. The agent creates the container's pid namespace itself
+				// (update_container_namespaces); a forwarded entry gives the agent a
+				// second pid entry and ExecProcess then fails "failed to join pidns:
+				// EINVAL". SandboxPidns stays false: ateom runs no pause container.
+				continue
 			}
 			l.Namespaces = append(l.Namespaces, &agentpb.LinuxNamespace{Type: string(ns.Type)})
 		}
