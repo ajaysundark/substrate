@@ -224,3 +224,23 @@ func TestGuestConfigDebugConsole(t *testing.T) {
 		}
 	}
 }
+
+func TestGuestConfigMemAgentAndZram(t *testing.T) {
+	_, _, kparams := (&AteomService{}).guestConfig()
+	for _, absent := range []string{"agent.mem_agent", "psi=1", "zram_percent"} {
+		if strings.Contains(kparams, absent) {
+			t.Errorf("expected default guestConfig() not to contain %q, got %q", absent, kparams)
+		}
+	}
+
+	svc := &AteomService{
+		guestMemAgent:    &kata.MemAgentConfig{MemcgPeriod: 10 * time.Second, CompactPeriod: 30 * time.Second},
+		guestZramPercent: 20,
+	}
+	_, _, kparams = svc.guestConfig()
+	for _, want := range []string{"psi=1", "agent.mem_agent_enable=true", "agent.mem_agent_memcg_period_secs=10", "agent.mem_agent_compact_period_secs=30", "zram_percent=20"} {
+		if !strings.Contains(kparams, want) {
+			t.Errorf("expected guestConfig() to contain %q, got %q", want, kparams)
+		}
+	}
+}

@@ -739,6 +739,10 @@ func (s *AteomService) guestConfig() (memMiB, vcpus int, kparams string) {
 	if s.guestDebug {
 		kparams = kata.WithAgentDebug(kparams)
 	}
+	if s.guestMemAgent != nil {
+		kparams = kata.WithMemAgent(kparams, *s.guestMemAgent)
+	}
+	kparams = kata.WithZramPercent(kparams, s.guestZramPercent)
 	return kata.DefaultMemoryMiB, kata.DefaultVCPUs, kparams
 }
 

@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/compute/metadata"
+	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/kata"
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/reaper"
 	"github.com/agent-substrate/substrate/internal/actorlock"
 	"github.com/agent-substrate/substrate/internal/actorlog"
@@ -68,6 +69,15 @@ var (
 	vmmMemReserve = pflag.Int("vmm-mem-reserve-mib", vmmMemReserveMiB, "Guest RAM (MiB) held back from the pod's memory limit for the cloud-hypervisor VMM + virtiofsd, which run as host processes in the pod cgroup alongside the guest RAM. Prevents the pod OOMing when the VM is sized to the pod's memory limit.")
 	showVersion   = pflag.Bool("version", false, "Print version and exit.")
 	logLevelFlag  = pflag.String("log-level", "info", "Minimum log level: debug, info, warn, or error.")
+
+	guestMemAgent = pflag.Bool("guest-mem-agent", false,
+		"Enable the kata-agent mem-agent in guests: periodic MGLRU memcg reclaim (swapping to guest zram when the guest has it) and memory compaction, so free page reporting can return the freed memory to the host. Also enables guest PSI.")
+	guestMemAgentMemcgPeriod = pflag.Duration("guest-mem-agent-memcg-period", 10*time.Second,
+		"With --guest-mem-agent, interval between mem-agent memcg reclaim runs, in whole seconds. 0 disables memcg reclaim.")
+	guestMemAgentCompactPeriod = pflag.Duration("guest-mem-agent-compact-period", 10*time.Second,
+		"With --guest-mem-agent, interval between mem-agent compaction runs, in whole seconds. 0 disables compaction.")
+	guestZramPercent = pflag.Int("guest-zram-percent", 0,
+		"Size of the guest zram swap device as a percentage of guest memory (1 to 100), passed as zram_percent on the guest kernel command line. 0 (the default) passes nothing. Needs a guest kernel with CONFIG_ZRAM and a guest rootfs whose init reads zram_percent; the stock kata assets have neither.")
 
 	otlpRelaySocket = pflag.String("otlp-relay-socket", nodepath.AteletOTLPSocketPath(),
 		"Unix socket of atelet's OTLP relay to export telemetry through, keeping it off the pod network. Empty, or absent at startup, exports directly to OTEL_EXPORTER_OTLP_ENDPOINT instead.")
@@ -112,6 +122,12 @@ func do(ctx context.Context) error {
 	slog.InfoContext(ctx, "ateom-microvm booting", slog.String("version", version.Version))
 	if *maxActors < 0 {
 		return fmt.Errorf("--max-actors must not be negative, got %d", *maxActors)
+	}
+	if *guestZramPercent < 0 || *guestZramPercent > 100 {
+		return fmt.Errorf("--guest-zram-percent must be between 0 and 100, got %d", *guestZramPercent)
+	}
+	if *guestMemAgentMemcgPeriod < 0 || *guestMemAgentCompactPeriod < 0 {
+		return fmt.Errorf("--guest-mem-agent-memcg-period and --guest-mem-agent-compact-period must not be negative")
 	}
 	if *usageSampleInterval < minUsageSampleInterval {
 		return fmt.Errorf("--usage-sample-interval must be at least %v, got %v", minUsageSampleInterval, *usageSampleInterval)
@@ -233,6 +249,13 @@ func do(ctx context.Context) error {
 	}
 	ateomService := NewService(*podUID, *chBinary, *guestDebug, *vmmMemReserve, *maxActors, tunnel, actorLogger)
 	ateomService.actorCgroups = actorCgroups
+	if *guestMemAgent {
+		ateomService.guestMemAgent = &kata.MemAgentConfig{
+			MemcgPeriod:   *guestMemAgentMemcgPeriod,
+			CompactPeriod: *guestMemAgentCompactPeriod,
+		}
+	}
+	ateomService.guestZramPercent = *guestZramPercent
 	// The controller sets both from the downward API.
 	pool := ateomstats.Pool{Namespace: os.Getenv("POD_NAMESPACE"), Name: os.Getenv("WORKER_POOL_NAME")}
 	if pool.Namespace == "" || pool.Name == "" {
@@ -353,6 +376,12 @@ type AteomService struct {
 	podUID     string
 	chBinary   string
 	guestDebug bool
+	// guestMemAgent enables the kata-agent mem-agent in guests. Nil (the
+	// default) leaves it off.
+	guestMemAgent *kata.MemAgentConfig
+	// guestZramPercent sizes the guest zram device (zram_percent=); 0 passes
+	// nothing.
+	guestZramPercent int
 
 	// memReserveMiB is guest RAM (MiB) held back from the pod's memory limit for
 	// the cloud-hypervisor VMM + virtiofsd (host processes sharing the pod cgroup
