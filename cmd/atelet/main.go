@@ -109,6 +109,7 @@ var (
 	imageCredentialProviderBinDir = pflag.String("image-credential-provider-bin-dir", "", "Directory holding the credential provider executables named by --image-credential-provider-config. Required when that flag is set.")
 
 	localhostRegistryReplacement = pflag.String("localhost-registry-replacement", "", "The replacement registry endpoint for localhost and/or loopback IP addresses, useful for local development. for example kind-registry:5000")
+	hostEROFSLayers              = pflag.Bool("host-erofs-layers", false, "Cache the layers of gVisor actor images, and of image volumes for every sandbox class, as EROFS images the host mounts, instead of unpacked trees: ownership, setuid bits, mtimes and xattrs the unprivileged unpack drops survive. Needs EROFS in the host kernel.")
 	microvmEROFSDAX              = pflag.Bool("microvm-erofs-dax", true, "Cache the layers of micro-VM actor images as EROFS images that the guest mounts over virtio-pmem with DAX, instead of trees the host merges and serves over virtio-fs.")
 	imageCacheDir                = pflag.String("image-cache-dir", ateletpath.ImageCacheDir, "Directory for the node-local OCI image layer cache. Must be on the volume shared with the worker pods (the cached layers are their overlay lowerdirs), and on a disk sized for both capacity and IOPS: unpack throughput is gated by the volume's IOPS.")
 
@@ -242,6 +243,9 @@ func main() {
 		imagecache.WithMinAge(*imageCacheMinAge),
 		imagecache.WithMeter(otel.Meter("atelet")),
 	)
+	if *hostEROFSLayers && !imagecache.HostMountsEROFS() {
+		serverboot.Fatal(ctx, "--host-erofs-layers needs EROFS in the host kernel (CONFIG_EROFS_FS), which this node lacks", nil)
+	}
 	if err != nil {
 		serverboot.Fatal(ctx, "Failed to open image cache", err)
 	}
@@ -993,7 +997,8 @@ func (s *Atelet) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRequest
 
 // rootfsForm is the layer form an actor's container images are cached in.
 // Micro-VM actors get EROFS images the guest maps over virtio-pmem with DAX
-// (--microvm-erofs-dax); everything else, the fs/ trees the host merges.
+// (--microvm-erofs-dax); gVisor actors, EROFS images the host mounts
+// (--host-erofs-layers); everything else, the fs/ trees the host merges.
 //
 // The VM attaches at most ocispec.MaxEROFSLayers layer images (the slots of
 // the PCI segments reserved for them), shared by the actor's containers, so
@@ -1008,6 +1013,11 @@ func (s *Atelet) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRequest
 // snapshot without the guest's layer record ran host-merged, so its restore
 // pulls fs/ whatever the flag says.
 func rootfsForm(class string, snapshot *sandboxAssetsRecord, containers int) imagecache.Form {
+	if class == string(atev1alpha1.SandboxClassGvisor) {
+		// The host mounts the images; a snapshot does not pin the form, since
+		// gVisor's rootfs is composed on the host before every boot.
+		return imagecache.Form{EROFS: *hostEROFSLayers}
+	}
 	if class != string(atev1alpha1.SandboxClassMicroVM) {
 		return imagecache.Form{}
 	}
