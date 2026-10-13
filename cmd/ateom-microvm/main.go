@@ -79,6 +79,8 @@ var (
 		"Wait between the pre-snapshot guest reclaim and vm.pause. Must cover the guest free page reporting delay (2 s on an unpatched kernel, or --guest-page-reporting-delay-ms).")
 	presnapshotReclaimTarget = pflag.String("presnapshot-reclaim-target", kata.DefaultReclaimTarget,
 		"Bytes written to each guest top-level cgroup's memory.reclaim by the pre-snapshot reclaim.")
+	presnapshotReclaimDebugConsole = pflag.Bool("presnapshot-reclaim-debug-console", false,
+		"Benchmarking only, not for production: boot guests with the kata debug console (a guest root shell on vsock 1026) and let the pre-snapshot reclaim fall back to it when ExecProcess fails.")
 
 	otlpRelaySocket = pflag.String("otlp-relay-socket", nodepath.AteletOTLPSocketPath(),
 		"Unix socket of atelet's OTLP relay to export telemetry through, keeping it off the pod network. Empty, or absent at startup, exports directly to OTEL_EXPORTER_OTLP_ENDPOINT instead.")
@@ -247,8 +249,9 @@ func do(ctx context.Context) error {
 	ateomService.guestPageReportingDelayMS = *guestPageReportingDelayMS
 	if *presnapshotReclaim {
 		ateomService.presnapshotReclaim = &kata.ReclaimConfig{
-			Target: *presnapshotReclaimTarget,
-			Wait:   *presnapshotReclaimWait,
+			Target:       *presnapshotReclaimTarget,
+			Wait:         *presnapshotReclaimWait,
+			DebugConsole: *presnapshotReclaimDebugConsole,
 		}
 	}
 	// The controller sets both from the downward API.

@@ -739,6 +739,11 @@ func (s *AteomService) guestConfig() (memMiB, vcpus int, kparams string) {
 	if s.guestDebug {
 		kparams = kata.WithAgentDebug(kparams)
 	}
+	if s.presnapshotReclaim != nil && s.presnapshotReclaim.DebugConsole {
+		// Benchmarking only: the pre-snapshot reclaim may fall back to the
+		// debug console. Console only, no agent debug logging.
+		kparams = kata.WithDebugConsole(kparams)
+	}
 	kparams = kata.WithPageReportingDelay(kparams, s.guestPageReportingDelayMS)
 	return kata.DefaultMemoryMiB, kata.DefaultVCPUs, kparams
 }

@@ -501,7 +501,7 @@ func (s *AteomService) runPresnapshotReclaim(ctx context.Context, actorUID strin
 		}
 	}
 	t := time.Now()
-	rr := kata.PreSnapshotReclaim(ctx, *s.presnapshotReclaim, guestAgent, firstCtr)
+	rr := kata.PreSnapshotReclaim(ctx, *s.presnapshotReclaim, kata.VsockSocketPath(actorUID), guestAgent, firstCtr)
 	slog.InfoContext(ctx, "Pre-snapshot guest reclaim",
 		slog.String("id", actorUID),
 		slog.String("channel", rr.Channel),

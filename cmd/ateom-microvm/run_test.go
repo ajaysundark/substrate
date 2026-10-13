@@ -237,6 +237,32 @@ func TestGuestConfigPageReportingDelay(t *testing.T) {
 	}
 }
 
+func TestGuestConfigPresnapshotReclaimDebugConsole(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		reclaim     *kata.ReclaimConfig
+		wantConsole bool
+	}{
+		{name: "reclaim off", reclaim: nil},
+		{name: "reclaim on, agent only", reclaim: &kata.ReclaimConfig{}},
+		{name: "reclaim on, console opt-in", reclaim: &kata.ReclaimConfig{DebugConsole: true}, wantConsole: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, kparams := (&AteomService{presnapshotReclaim: tc.reclaim, guestPageReportingDelayMS: -1}).guestConfig()
+			if got := strings.Contains(kparams, "agent.debug_console agent.debug_console_vport=1026"); got != tc.wantConsole {
+				t.Errorf("guestConfig() kparams = %q, debug console present = %v, want %v", kparams, got, tc.wantConsole)
+			}
+			if strings.Contains(kparams, "agent.log=debug") {
+				t.Errorf("guestConfig() kparams = %q, must not enable agent debug logging", kparams)
+			}
+		})
+	}
+	_, _, both := (&AteomService{guestDebug: true, presnapshotReclaim: &kata.ReclaimConfig{DebugConsole: true}, guestPageReportingDelayMS: -1}).guestConfig()
+	if strings.Count(both, "agent.debug_console_vport=1026") != 1 {
+		t.Errorf("expected a single debug console param with guestDebug and the console opt-in, got %q", both)
+	}
+}
+
 func TestBuildVMConfigBalloon(t *testing.T) {
 	cfg := buildVMConfig("actor-1", "/vmlinux", "/rootfs.img", "", "/console.log", 256, 1, true, false)
 	if cfg.Balloon == nil || !cfg.Balloon.FreePageReporting || cfg.Balloon.Size != 0 {
