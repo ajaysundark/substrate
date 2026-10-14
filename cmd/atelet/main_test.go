@@ -259,7 +259,7 @@ func TestPrepareOCIBundlesPause(t *testing.T) {
 			useTempNodeDirs(t)
 			const actorUID = "actor-uid-1"
 			s := &Atelet{imageCache: newImageVolumeStore(t)}
-			if _, err := s.prepareOCIBundles(t.Context(), actorUID, resources.ActorRef{}, spec, tc.pauseImage); err != nil {
+			if _, err := s.prepareOCIBundles(t.Context(), actorUID, resources.ActorRef{}, spec, tc.pauseImage, imagecache.Form{}); err != nil {
 				t.Fatalf("prepareOCIBundles: %v", err)
 			}
 			if _, err := os.Stat(filepath.Join(ateletpath.OCIBundlePath(actorUID, "app"), imagecache.OverlaySpecFileName)); err != nil {
@@ -295,7 +295,7 @@ func TestPrepareOCIBundlesFillsContainerSpec(t *testing.T) {
 	}
 
 	s := &Atelet{imageCache: newImageVolumeStore(t)}
-	got, err := s.prepareOCIBundles(t.Context(), "actor-uid-1", resources.ActorRef{}, spec, "")
+	got, err := s.prepareOCIBundles(t.Context(), "actor-uid-1", resources.ActorRef{}, spec, "", imagecache.Form{})
 	if err != nil {
 		t.Fatalf("prepareOCIBundles: %v", err)
 	}
@@ -1594,5 +1594,55 @@ func TestServingCheck(t *testing.T) {
 	close(served)
 	if err := check(context.Background()); err != nil {
 		t.Errorf("servingCheck after the port opened = %v, want nil", err)
+	}
+}
+
+// rootfsForm picks EROFS layer images for micro-VM actors, capped at the
+// devices one VM attaches split across the actor's containers, and fs/ for
+// everything else and for a MEMORY or ROOTFS snapshot whose guest ran on a
+// host-merged rootfs.
+func TestRootfsForm(t *testing.T) {
+	prev := *microvmEROFSDAX
+	t.Cleanup(func() { *microvmEROFSDAX = prev })
+	*microvmEROFSDAX = true
+	erofs := imagecache.Form{EROFS: true, MaxEROFSLayers: ocispec.MaxEROFSLayers}
+	for name, tc := range map[string]struct {
+		class    string
+		snapshot *sandboxAssetsRecord
+		want     imagecache.Form
+	}{
+		"gvisor":                {class: "gvisor", want: imagecache.Form{}},
+		"microvm cold boot":     {class: "microvm", want: erofs},
+		"microvm volumes":       {class: "microvm", snapshot: &sandboxAssetsRecord{Fidelity: ateattr.SnapshotFidelityVolumes}, want: erofs},
+		"microvm memory, erofs": {class: "microvm", snapshot: &sandboxAssetsRecord{Fidelity: ateattr.SnapshotFidelityMemory, SnapshotFiles: []string{"memory-ranges", ocispec.EROFSLayersSnapshotFile}}, want: erofs},
+		"microvm memory, host":  {class: "microvm", snapshot: &sandboxAssetsRecord{Fidelity: ateattr.SnapshotFidelityMemory, SnapshotFiles: []string{"memory-ranges"}}, want: imagecache.Form{}},
+		"microvm rootfs, host":  {class: "microvm", snapshot: &sandboxAssetsRecord{Fidelity: ateattr.SnapshotFidelityRootfs, SnapshotFiles: []string{"rootfs-upper-web.tar"}}, want: imagecache.Form{}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := rootfsForm(tc.class, tc.snapshot, 1); got != tc.want {
+				t.Errorf("rootfsForm = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+	for containers, want := range map[int]int{0: ocispec.MaxEROFSLayers, 2: ocispec.MaxEROFSLayers / 2, 5: ocispec.MaxEROFSLayers / 5} {
+		if got := rootfsForm("microvm", nil, containers).MaxEROFSLayers; got != want {
+			t.Errorf("rootfsForm(%d containers).MaxEROFSLayers = %d, want %d", containers, got, want)
+		}
+	}
+	*microvmEROFSDAX = false
+	for name, tc := range map[string]struct {
+		snapshot *sandboxAssetsRecord
+		want     imagecache.Form
+	}{
+		"flag off, cold boot":          {want: imagecache.Form{}},
+		"flag off, memory, erofs":      {snapshot: &sandboxAssetsRecord{Fidelity: ateattr.SnapshotFidelityMemory, SnapshotFiles: []string{ocispec.EROFSLayersSnapshotFile}}, want: erofs},
+		"flag off, rootfs, host":       {snapshot: &sandboxAssetsRecord{Fidelity: ateattr.SnapshotFidelityRootfs}, want: imagecache.Form{}},
+		"flag off, volumes cold start": {snapshot: &sandboxAssetsRecord{Fidelity: ateattr.SnapshotFidelityVolumes}, want: imagecache.Form{}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := rootfsForm("microvm", tc.snapshot, 1); got != tc.want {
+				t.Errorf("rootfsForm = %+v, want %+v", got, tc.want)
+			}
+		})
 	}
 }

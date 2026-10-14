@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"sync"
 	"syscall"
@@ -108,6 +109,7 @@ var (
 	imageCredentialProviderBinDir = pflag.String("image-credential-provider-bin-dir", "", "Directory holding the credential provider executables named by --image-credential-provider-config. Required when that flag is set.")
 
 	localhostRegistryReplacement = pflag.String("localhost-registry-replacement", "", "The replacement registry endpoint for localhost and/or loopback IP addresses, useful for local development. for example kind-registry:5000")
+	microvmEROFSDAX              = pflag.Bool("microvm-erofs-dax", true, "Cache the layers of micro-VM actor images as EROFS images that the guest mounts over virtio-pmem with DAX, instead of trees the host merges and serves over virtio-fs.")
 	imageCacheDir                = pflag.String("image-cache-dir", ateletpath.ImageCacheDir, "Directory for the node-local OCI image layer cache. Must be on the volume shared with the worker pods (the cached layers are their overlay lowerdirs), and on a disk sized for both capacity and IOPS: unpack throughput is gated by the volume's IOPS.")
 
 	showVersion  = pflag.Bool("version", false, "Print version and exit.")
@@ -715,7 +717,7 @@ func (s *Atelet) Run(ctx context.Context, req *ateletpb.RunRequest) (resp *atele
 		return nil, err
 	}
 	containerSpecs, err := s.prepareOCIBundles(ctx, actorUID, actorRef,
-		req.GetSpec(), sandboxRec.PauseImage,
+		req.GetSpec(), sandboxRec.PauseImage, rootfsForm(sandboxRec.SandboxClass, nil, len(req.GetSpec().GetContainers())),
 	)
 	if err != nil {
 		return nil, err
@@ -987,6 +989,43 @@ func (s *Atelet) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRequest
 	dCleanup += time.Since(tCleanup)
 
 	return &ateletpb.CheckpointResponse{State: state}, nil
+}
+
+// rootfsForm is the layer form an actor's container images are cached in.
+// Micro-VM actors get EROFS images the guest maps over virtio-pmem with DAX
+// (--microvm-erofs-dax); everything else, the fs/ trees the host merges.
+//
+// The VM attaches at most ocispec.MaxEROFSLayers layer images (the slots of
+// the PCI segments reserved for them), shared by the actor's containers, so
+// each container's image gets an equal share of that budget as its cap; an
+// image over its share is cached as fs/ and merged on the host for that
+// container alone. Dividing evenly wastes slots when containers share an
+// image, but it keeps the sum within the budget by construction, so no actor
+// that boots with the flag off is refused with it on.
+//
+// A MEMORY or ROOTFS snapshot fixes how its guest had the rootfs mounted, and
+// the frozen guest or the upper it carries only works that way: such a
+// snapshot without the guest's layer record ran host-merged, so its restore
+// pulls fs/ whatever the flag says.
+func rootfsForm(class string, snapshot *sandboxAssetsRecord, containers int) imagecache.Form {
+	if class != string(atev1alpha1.SandboxClassMicroVM) {
+		return imagecache.Form{}
+	}
+	erofs := imagecache.Form{EROFS: true, MaxEROFSLayers: ocispec.MaxEROFSLayers / max(containers, 1)}
+	if snapshot != nil {
+		switch snapshot.Fidelity {
+		case ateattr.SnapshotFidelityMemory, ateattr.SnapshotFidelityRootfs:
+			// The record wins over the flag in both directions.
+			if slices.Contains(snapshot.SnapshotFiles, ocispec.EROFSLayersSnapshotFile) {
+				return erofs
+			}
+			return imagecache.Form{}
+		}
+	}
+	if !*microvmEROFSDAX {
+		return imagecache.Form{}
+	}
+	return erofs
 }
 
 func checkpointSnapshotFiles(resp *ateworkerpb.CheckpointWorkloadResponse, required bool) (files, dataFiles []string, err error) {
@@ -1481,7 +1520,7 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 			return err
 		}
 		t := time.Now()
-		containerSpecs, err = s.prepareOCIBundles(gctx, actorUID, actorRef, req.GetSpec(), runtimeRec.PauseImage)
+		containerSpecs, err = s.prepareOCIBundles(gctx, actorUID, actorRef, req.GetSpec(), runtimeRec.PauseImage, rootfsForm(runtimeRec.SandboxClass, sandboxRec, len(req.GetSpec().GetContainers())))
 		dBundles = time.Since(t)
 		if err != nil {
 			prepFailedPhase = ateattr.SnapshotPhaseOCIUnpack
@@ -1773,6 +1812,7 @@ func (s *Atelet) prepareOCIBundles(
 	actorRef resources.ActorRef,
 	spec *ateletpb.WorkloadSpec,
 	pauseImage string,
+	form imagecache.Form,
 ) ([]*ateworkerpb.ContainerSpec, error) {
 	// Prepare host folders for volume types that need them.
 	for _, vol := range spec.GetVolumes() {
@@ -1803,7 +1843,7 @@ func (s *Atelet) prepareOCIBundles(
 			envs = append(envs, fmt.Sprintf("%s=%s", env.GetName(), env.GetValue()))
 		}
 		g.Go(func() error {
-			imageConfig, err := prepareOCIDirectory(gCtx, s.imageCache, actorUID, ctr.GetName(), ctr.GetImage(), imagecache.Form{}, spec.GetVolumes(), ctr.GetVolumeMounts())
+			imageConfig, err := prepareOCIDirectory(gCtx, s.imageCache, actorUID, ctr.GetName(), ctr.GetImage(), form, spec.GetVolumes(), ctr.GetVolumeMounts())
 			if err != nil {
 				return wrapFileSystemErr(fmt.Sprintf("while creating %q OCI bundle", ctr.GetName()), err)
 			}

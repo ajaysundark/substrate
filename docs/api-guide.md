@@ -510,6 +510,8 @@ A `microvm` `SandboxConfig` supplies the [Kata Containers](https://katacontainer
 
 See [`hack/microvm-assets/`](../hack/microvm-assets/) for scripts that assemble and stage these assets, plus a worked counter demo (`demos/counter/counter-microvm.yaml.tmpl`) that suspends and resumes an in-RAM counter across worker pods.
 
+A micro-VM container's rootfs is an overlay of the image's cached layers and a writable upper on the worker's disk. By default (atelet's `--microvm-erofs-dax`), the image cache builds an EROFS image for each layer at unpack time, attaches each layer as a read-only `virtio-pmem` device with DAX, and lets the guest mount the overlay over the virtio-fs upper, so the image's pages live once in the node's page cache and are shared by every actor. The layer devices sit on PCI segments of their own (31 per segment, up to four segments, so 124 layers per VM, split evenly across the actor's containers), leaving the VM's main segment untouched. With the flag off, or for an image with more layers than its share, the host kernel mounts the overlay and shares the merged tree over virtio-fs. Snapshots record the layer digests and restore verifies they match before resuming; a snapshot restores the way its guest ran either way.
+
 ---
 
 ## 4. Operational Workflow

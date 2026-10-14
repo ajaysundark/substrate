@@ -39,6 +39,31 @@ const (
 	ShareVolumes    = "volumes"
 )
 
+// EROFS layer images in the micro-VM guest (cmd/ateworker-microvm/erofs.go), the
+// parts atelet needs to pick a bundle's layer form.
+const (
+	// EROFSLayerSegmentSlots is how many layer images fit on one PCI segment:
+	// a segment has 32 slots and the host bridge takes one. Layer images get
+	// PCI segments of their own (from EROFSFirstPCISegment up), so they never
+	// compete with the devices on segment 0 (guest image, console, rng, vsock,
+	// net, and whatever is added later) or with virtio-fs on segment 1.
+	EROFSLayerSegmentSlots = 31
+	// EROFSFirstPCISegment is the first PCI segment that carries layer images.
+	EROFSFirstPCISegment = 2
+	// EROFSLayerSegments is the most segments one VM gives to layer images.
+	// Four cover 124 layers, past the 127 Docker allows for an image.
+	// Cloud Hypervisor allows 96 segments in all; the VM only creates the
+	// ones its layers fill.
+	EROFSLayerSegments = 4
+	// MaxEROFSLayers is the most distinct layer images one VM attaches. An
+	// image with more layers is cached as fs/ and merged on the host.
+	MaxEROFSLayers = EROFSLayerSegmentSlots * EROFSLayerSegments
+	// EROFSLayersSnapshotFile is the file a snapshot carries when its guest
+	// merged the rootfs from layer images; its absence means the guest ran
+	// on a host-merged rootfs, which a restore must reproduce.
+	EROFSLayersSnapshotFile = "erofs-layers.json"
+)
+
 // MicroVMOptions describes the micro-VM context of one actor container.
 type MicroVMOptions struct {
 	// ActorDirs are the actor's directories; volume bind sources under them are
