@@ -26,6 +26,7 @@ type VmConfig struct {
 	Cpus     CpusConfig      `json:"cpus"`
 	Memory   MemoryConfig    `json:"memory"`
 	Payload  PayloadConfig   `json:"payload"`
+	Disks    []DiskConfig    `json:"disks,omitempty"`
 	Pmem     []PmemConfig    `json:"pmem,omitempty"`
 	Fs       []FsConfig      `json:"fs,omitempty"`
 	Balloon  *BalloonConfig  `json:"balloon,omitempty"`
@@ -89,6 +90,17 @@ type PmemConfig struct {
 	DiscardWrites bool `json:"discard_writes,omitempty"`
 	// PciSegment is the PCI segment the device sits on; 0 when unset.
 	PciSegment int32 `json:"pci_segment,omitempty"`
+}
+
+// DiskConfig is a virtio-blk disk: a container's writable rootfs upper (see
+// cmd/ateworker-microvm/rootfsdisk.go).
+type DiskConfig struct {
+	Path      string `json:"path"`
+	Readonly  bool   `json:"readonly"`
+	Direct    bool   `json:"direct"`
+	NumQueues int32  `json:"num_queues,omitempty"`
+	QueueSize int32  `json:"queue_size,omitempty"`
+	ImageType string `json:"image_type,omitempty"`
 }
 
 // RngConfig sets the entropy source (kata uses /dev/urandom).

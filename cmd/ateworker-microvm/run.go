@@ -128,6 +128,10 @@ const (
 	// guestImagePmemID names the virtio-pmem device that carries the guest
 	// image, in the VM config and so in every snapshot's config.json.
 	guestImagePmemID = "guest-image"
+	// assetMke2fs is optional: when the SandboxConfig lists it, containers on
+	// EROFS layer images keep their rootfs upper on a virtio-blk disk
+	// (rootfsdisk.go).
+	assetMke2fs = "mke2fs"
 )
 
 // kataAgentPath is where the kata guest image keeps the agent binary. buildVMConfig
@@ -226,6 +230,7 @@ func (c *actorContainer) erofsVolumeNames() []string {
 type resolvedRuntime struct {
 	chBinary  string // path to the cloud-hypervisor binary
 	virtiofsd string // path to virtiofsd (overlay RO lower); "" => "virtiofsd" on PATH
+	mke2fs    string // path to mke2fs for upper disks; "" => uppers stay on the share
 }
 
 // firstNonEmpty returns the first non-empty string, or "" if all are empty.
@@ -244,6 +249,7 @@ func (s *AteWorkerService) resolveRuntime(paths map[string]string) resolvedRunti
 	return resolvedRuntime{
 		chBinary:  firstNonEmpty(paths[assetCH], s.chBinary),
 		virtiofsd: paths[assetVirtiofsd],
+		mke2fs:    paths[assetMke2fs],
 	}
 }
 
@@ -549,6 +555,9 @@ func (s *AteWorkerService) coldBootActor(ctx context.Context, p actorBootParams)
 			vfsdProc.Stop()
 		}
 	}()
+	if err := makeUpperDisks(ctx, rr.mke2fs, rootfsUpperDir(p.actorDirs), ctrs); err != nil {
+		return err
+	}
 
 	// Launch a bare VMM (CH + api-socket); ateworker owns this process for teardown.
 	apiSocket := filepath.Join(kata.VMDir(actorUID), "clh-api.sock")
@@ -575,8 +584,9 @@ func (s *AteWorkerService) coldBootActor(ctx context.Context, p actorBootParams)
 	// on a failed agent dial below, so keep it here.
 	consoleLog := kata.ConsoleLogPath(actorUID)
 	devs := newEROFSDevices(ctrs)
+	upperDisks := devs.addUpperDisks(rootfsUpperDir(p.actorDirs), ctrs)
 	vmCfg := buildVMConfig(actorUID, kernel, image, kparams, consoleLog, memMiB, vcpus,
-		agentInit(ctx, client.Info()), s.guestDebug, devs.pmem, devs.pciSegments())
+		agentInit(ctx, client.Info()), s.guestDebug, devs.pmem, devs.pciSegments(), upperDisks)
 	if err := client.CreateVM(ctx, vmCfg); err != nil {
 		return fmt.Errorf("while creating VM: %w", err)
 	}
@@ -885,7 +895,7 @@ func initParams(agentInit bool) string {
 // the earliest messages: hvc0 only exists once virtio-console probes, so the memory
 // map, CPU features and ACPI lines never reach the log. guestDebug adds the UART back
 // with earlycon (and pays the ~800ms) for diagnosing a guest that dies before then.
-func buildVMConfig(id, kernel, image, kparams, consoleLog string, memMiB, vcpus int, agentInit, debug bool, pmem []ch.PmemConfig, pciSegments int32) ch.VmConfig {
+func buildVMConfig(id, kernel, image, kparams, consoleLog string, memMiB, vcpus int, agentInit, debug bool, pmem []ch.PmemConfig, pciSegments int32, upperDisks []ch.DiskConfig) ch.VmConfig {
 	cmdline := "root=/dev/pmem0p1 rootflags=dax,data=ordered,errors=remount-ro ro rootfstype=ext4 " +
 		"panic=1 no_timer_check noreplace-smp console=hvc0 " +
 		initParams(agentInit)
@@ -907,6 +917,7 @@ func buildVMConfig(id, kernel, image, kparams, consoleLog string, memMiB, vcpus 
 		// The guest image is a virtio-pmem device (/dev/pmem0), mounted read-only
 		// with DAX, so its file data stays in the host page cache instead of being copied into guest RAM.
 		Pmem:     append([]ch.PmemConfig{{ID: guestImagePmemID, File: image, DiscardWrites: true}}, pmem...),
+		Disks:    upperDisks,
 		Fs:       buildFsConfigs(id),
 		Balloon:  &ch.BalloonConfig{FreePageReporting: true},
 		Platform: &ch.PlatformConfig{NumPciSegments: pciSegments},

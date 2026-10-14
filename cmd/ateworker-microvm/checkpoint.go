@@ -164,6 +164,21 @@ func (s *AteWorkerService) CheckpointWorkload(ctx context.Context, req *ateworke
 			return nil, err
 		}
 	}
+	// A ROOTFS snapshot boots a fresh guest on the upper disks, so the guest
+	// unmounts them before the pause (rootfsdisk.go).
+	if scope == ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS {
+		var onDisk []string
+		for _, c := range ctrs {
+			if c.erofs && hasUpperDisk(rootfsUpperDir(actorDirs), c.name) {
+				onDisk = append(onDisk, c.id)
+			}
+		}
+		if len(onDisk) > 0 {
+			if err := flushUpperDisks(ctx, kata.VsockSocketPath(actorUID), onDisk); err != nil {
+				return nil, err
+			}
+		}
+	}
 
 	tPause := time.Now()
 	dPrep = tPause.Sub(tStart)

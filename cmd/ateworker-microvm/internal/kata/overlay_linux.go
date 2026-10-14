@@ -559,6 +559,25 @@ func EROFSLayerMount(layer, device int) PmemMount {
 	}
 }
 
+// UpperDiskMount returns the sandbox storage mount for cid's upper ext4 disk,
+// the device-th virtio-blk disk of the VM config. Like pmem, virtio-blk
+// disks are cold-plugged and probe in config order, so the slot names them.
+func UpperDiskMount(device int, cid string) PmemMount {
+	return PmemMount{
+		Device:     "/dev/vd" + string(rune('a'+device)),
+		Fstype:     "ext4",
+		Options:    []string{"noinit_itable"},
+		MountPoint: guestContainerBase + "upper/" + cid,
+	}
+}
+
+// NewGuestOverlayAt returns a GuestOverlay with upperdir and workdir under
+// base (an upper disk's mount, see UpperDiskMount). The upper keeps the
+// userxattr dialect of the share, so the same upper contents work on both.
+func NewGuestOverlayAt(layerMounts []string, base string) *GuestOverlay {
+	return &GuestOverlay{LowerDirs: layerMounts, UpperDir: base + "/fs", WorkDir: base + "/work"}
+}
+
 // GuestOverlay describes the rootfs overlay mounted inside the guest.
 type GuestOverlay struct {
 	// LowerDirs are the mounted layer paths, top-most first.

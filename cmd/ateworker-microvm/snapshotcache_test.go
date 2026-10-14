@@ -29,6 +29,7 @@ import (
 const (
 	testRestoreStateDir = "restore-state"
 	testRootfsUpperTar  = "rootfs-upper-app.tar"
+	testRootfsUpperDisk = "rootfs-disk-app.ext4"
 	testDurableDirTar   = "durable-dir-data.tar"
 )
 
@@ -37,7 +38,7 @@ func TestDropStagedMemoryImage(t *testing.T) {
 	if err := os.MkdirAll(restoreDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	stagedFiles := []string{memoryRangesFile, testRootfsUpperTar, testDurableDirTar}
+	stagedFiles := []string{memoryRangesFile, testRootfsUpperTar, testRootfsUpperDisk, testDurableDirTar}
 	for _, name := range stagedFiles {
 		if err := os.WriteFile(filepath.Join(restoreDir, name), []byte("staged data"), 0o600); err != nil {
 			t.Fatal(err)

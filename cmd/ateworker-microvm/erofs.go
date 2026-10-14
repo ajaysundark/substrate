@@ -167,6 +167,9 @@ type erofsDevices struct {
 	pmem   []ch.PmemConfig
 	mounts []kata.PmemMount
 	index  map[string]int // layer dir -> layer index (device index - erofsFirstPmemDevice)
+	// upperBase maps a container whose upper is on a virtio-blk disk
+	// (rootfsdisk.go) to the guest mount of that disk.
+	upperBase map[string]string
 }
 
 // pciSegments is how many PCI segments the VM needs so that every layer
@@ -250,6 +253,9 @@ func (d *erofsDevices) overlay(c actorContainer) *kata.GuestOverlay {
 	lowers := make([]string, 0, len(c.erofsLayers))
 	for _, layer := range c.erofsLayers {
 		lowers = append(lowers, kata.EROFSLayerMountPoint(d.index[layer]))
+	}
+	if base, ok := d.upperBase[c.name]; ok {
+		return kata.NewGuestOverlayAt(lowers, base)
 	}
 	return kata.NewGuestOverlay(c.id, lowers)
 }

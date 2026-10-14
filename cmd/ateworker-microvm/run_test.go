@@ -173,7 +173,7 @@ func TestBuildVMConfigConsole(t *testing.T) {
 	const id = "actor-1"
 	consoleLog := kata.ConsoleLogPath(id)
 
-	cfg := buildVMConfig(id, "/vmlinux", "/rootfs.img", "", consoleLog, 256, 1, true, false, nil, 2)
+	cfg := buildVMConfig(id, "/vmlinux", "/rootfs.img", "", consoleLog, 256, 1, true, false, nil, 2, nil)
 	if cfg.Console == nil || cfg.Console.Mode != "File" || cfg.Console.File != consoleLog {
 		t.Errorf("Console = %+v, want File %q", cfg.Console, consoleLog)
 	}
@@ -190,7 +190,7 @@ func TestBuildVMConfigConsole(t *testing.T) {
 		t.Errorf("cmdline = %q, must not pay for earlycon outside debug mode", cfg.Payload.Cmdline)
 	}
 
-	dbg := buildVMConfig(id, "/vmlinux", "/rootfs.img", "", consoleLog, 256, 1, true, true, nil, 2)
+	dbg := buildVMConfig(id, "/vmlinux", "/rootfs.img", "", consoleLog, 256, 1, true, true, nil, 2, nil)
 	if dbg.Serial == nil || dbg.Serial.Mode != "File" || dbg.Serial.File != kata.SerialLogPath(id) {
 		t.Errorf("debug Serial = %+v, want File %q", dbg.Serial, kata.SerialLogPath(id))
 	}
@@ -238,7 +238,7 @@ func TestKernelParamsDebugConsole(t *testing.T) {
 }
 
 func TestBuildVMConfigBalloon(t *testing.T) {
-	cfg := buildVMConfig("actor-1", "/vmlinux", "/rootfs.img", "", "/console.log", 256, 1, true, false, nil, 2)
+	cfg := buildVMConfig("actor-1", "/vmlinux", "/rootfs.img", "", "/console.log", 256, 1, true, false, nil, 2, nil)
 	if cfg.Balloon == nil || !cfg.Balloon.FreePageReporting || cfg.Balloon.Size != 0 {
 		t.Fatalf("cfg.Balloon = %+v, want size 0 with free page reporting", cfg.Balloon)
 	}

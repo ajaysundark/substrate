@@ -14,6 +14,23 @@ and a writable upper on the host, served by `virtiofsd`. The asset set is four f
 The guest kernel needs `erofs`, `virtio_pmem`, and `FS_DAX`; Kata's default guest kernel
 config enables them. An actor whose containers use more than 155 distinct layers is refused.
 
+An optional `mke2fs` asset (e2fsprogs 1.47 or later, statically linked, since the
+worker image has no libc) moves those containers' writable upper off the virtio-fs
+share onto a per-container virtio-blk ext4 disk, so a checkpoint ships one image
+file instead of archiving the upper file by file. `assemble.sh` does not produce
+it; to build one:
+
+```sh
+curl -fsSLO https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v1.47.1/e2fsprogs-1.47.1.tar.gz
+tar xzf e2fsprogs-1.47.1.tar.gz && cd e2fsprogs-1.47.1
+./configure CFLAGS="-O2 -std=gnu17" LDFLAGS=-static --disable-nls --disable-fuse2fs \
+  --disable-elf-shlibs --enable-libuuid --enable-libblkid
+make libs && make -C misc mke2fs && strip -o mke2fs misc/mke2fs
+```
+
+Then add it to the `SandboxConfig` version's assets next to `virtiofsd` (key `mke2fs`,
+with its `url` and `sha256`). Actors keep the upper layout their snapshot recorded.
+
 These helpers assemble the asset set for your node arch, stage it into the cluster's rustfs
 S3 bucket, and the demo manifest's `SandboxConfig` points at it. When `/dev/kvm` is
 available, `hack/create-kind-cluster.sh` mounts it into the node; atelet then advertises

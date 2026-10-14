@@ -288,7 +288,7 @@ func (s *AteWorkerService) restoreMemoryFidelity(ctx context.Context, p actorBoo
 	// Repoint the snapshot's per-actor paths to this actor's: its VMDir
 	// sockets and files, and the kernel and guest image atelet staged under
 	// this actor's own directory.
-	if err := rewriteSnapshotPaths(restoreDir, actorUID, kernel, image, erofsRec); err != nil {
+	if err := rewriteSnapshotPaths(restoreDir, actorUID, kernel, image, erofsRec, rootfsUpperDir(p.actorDirs)); err != nil {
 		return fmt.Errorf("while rewriting snapshot paths: %w", err)
 	}
 	srcID := actorUID
@@ -636,7 +636,7 @@ func restoreGuestReadyError(ctx context.Context, step string, err error) error {
 // changes none of this. The overlay has no per-actor disk to repoint, and
 // EROFS layer images (erofs.go) sit in the node-wide image cache, so they
 // stay as recorded.
-func rewriteSnapshotPaths(snapshotDir, id, kernel, image string, layers *erofsLayers) error {
+func rewriteSnapshotPaths(snapshotDir, id, kernel, image string, layers *erofsLayers, upperBase ...string) error {
 	cfgPath := filepath.Join(snapshotDir, "config.json")
 	b, err := os.ReadFile(cfgPath)
 	if err != nil {
@@ -740,6 +740,13 @@ func rewriteSnapshotPaths(snapshotDir, id, kernel, image string, layers *erofsLa
 	}
 	if !guestImage {
 		return fmt.Errorf("snapshot config %q has no %q pmem device", cfgPath, guestImagePmemID)
+	}
+	if len(upperBase) > 0 {
+		dChanged, err := rewriteUpperDiskPaths(cfg, cfgPath, upperBase[0])
+		if err != nil {
+			return err
+		}
+		changed = changed || dChanged
 	}
 	if !changed {
 		// Same-actor resume: nothing to rewrite, so leave a preserved snapshot untouched.

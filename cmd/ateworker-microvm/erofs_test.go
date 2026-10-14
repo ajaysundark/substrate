@@ -37,14 +37,14 @@ import (
 // image, in device order.
 func TestBuildVMConfigPmem(t *testing.T) {
 	pmem := []ch.PmemConfig{{File: "/pool/a/layer.erofs", DiscardWrites: true, ID: "erofs0"}}
-	cfg := buildVMConfig("uid", "/vmlinux", "/rootfs.img", "", "/c.log", 256, 1, true, false, pmem, 3)
+	cfg := buildVMConfig("uid", "/vmlinux", "/rootfs.img", "", "/c.log", 256, 1, true, false, pmem, 3, nil)
 	if len(cfg.Pmem) != erofsFirstPmemDevice+len(pmem) || cfg.Pmem[0].File != "/rootfs.img" || !slices.Equal(cfg.Pmem[erofsFirstPmemDevice:], pmem) {
 		t.Errorf("Pmem = %+v, want the guest image then %+v", cfg.Pmem, pmem)
 	}
 }
 
-// fakeEROFSLayer creates a cached layer directory with an image file and its
-// digest record.
+// fakeEROFSLayer creates a cached layer directory holding an image file and
+// its digest record, enough for the host-side bookkeeping under test.
 func fakeEROFSLayer(t *testing.T, pool, name, digest string) string {
 	t.Helper()
 	dir := filepath.Join(pool, name)
@@ -80,9 +80,10 @@ func TestEROFSDevices(t *testing.T) {
 			t.Errorf("mounts[%d] = %+v, want pmem device %d", i, devs.mounts[i], erofsFirstPmemDevice+i)
 		}
 	}
-	// Each guest mount's /dev/pmemN is the slot of its image in the VM
-	// config.
-	cfg := buildVMConfig("uid", "/vmlinux", "/rootfs.img", "", "/c.log", 256, 1, true, false, devs.pmem, devs.pciSegments())
+	// The guest names a pmem device by its slot in the VM config, so the
+	// config buildVMConfig emits must hold each layer image at the slot its
+	// guest mount names, whatever else the config puts on pmem.
+	cfg := buildVMConfig("uid", "/vmlinux", "/rootfs.img", "", "/c.log", 256, 1, true, false, devs.pmem, devs.pciSegments(), nil)
 	for i, m := range devs.mounts {
 		var slot int
 		if _, err := fmt.Sscanf(m.Device, "/dev/pmem%d", &slot); err != nil {
@@ -105,8 +106,8 @@ func TestEROFSDevices(t *testing.T) {
 	if devs := newEROFSDevices(ctrs[2:]); len(devs.pmem) != 0 || len(devs.mounts) != 0 || devs.pciSegments() != 2 {
 		t.Errorf("devices without EROFS containers = %+v, want none on the two kata segments", devs)
 	}
-	// Layer images fill segments from 2 up, 31 to a segment, and the VM gets
-	// only the segments they fill.
+	// Layer images sit on PCI segments of their own, 31 to a segment from
+	// segment 2 up, and the VM gets exactly the segments they fill.
 	for i, p := range devs.pmem {
 		if p.PciSegment != int32(erofsFirstPCISegment) {
 			t.Errorf("pmem[%d].PciSegment = %d, want %d", i, p.PciSegment, erofsFirstPCISegment)
@@ -131,9 +132,9 @@ func TestEROFSDevices(t *testing.T) {
 	}
 }
 
-// The record round-trips through the checkpoint directory, and verify and
-// checkMode compare it with this node's containers: mode, layer list, and
-// recorded digests.
+// The record round-trips through the checkpoint directory, and the restore
+// checks it against what this node has: the same mode per container, the
+// same layers, the same bytes.
 func TestEROFSLayersRecord(t *testing.T) {
 	pool := t.TempDir()
 	app := fakeEROFSLayer(t, pool, "app", "sha256:aaa")
@@ -181,7 +182,8 @@ func TestEROFSLayersRecord(t *testing.T) {
 		})
 	}
 
-	// checkMode rejects a mismatch in either direction.
+	// The bundle must mount the rootfs the way the snapshot's guest had it,
+	// in both directions; atelet pulls the form the record implies.
 	plain := actorContainer{name: "plain", erofs: true, erofsLayers: []string{base}}
 	if err := rec.checkMode(&plain); err == nil || !strings.Contains(err.Error(), "no EROFS layer record in its snapshot") {
 		t.Errorf("checkMode(plain now on EROFS) = %v, want an error", err)
@@ -206,7 +208,7 @@ func TestEROFSLayersRecord(t *testing.T) {
 	if err := none.verify([]actorContainer{cold}); err != nil {
 		t.Errorf("verify on a cold boot = %v, want nil", err)
 	}
-	// A different recorded digest on this node fails verify.
+	// A node whose copy of a layer differs cannot serve the guest's mappings.
 	if err := os.WriteFile(imagecache.LayerEROFSPath(base)+".sha256", []byte("sha256:ccc\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +222,8 @@ func TestEROFSLayersRecord(t *testing.T) {
 		t.Errorf("verify with a missing image = %v, want not exist", err)
 	}
 
-	// Without a record, only host-merged containers pass.
+	// No record: nothing ran on EROFS, and a snapshot without one restores
+	// only host-merged containers.
 	empty, err := readEROFSLayers(t.TempDir())
 	if err != nil || empty.isEROFS("web") {
 		t.Errorf("readEROFSLayers(empty) = %+v, %v", empty, err)
@@ -237,8 +240,9 @@ func TestEROFSLayersRecord(t *testing.T) {
 	}
 }
 
-// A guest-merged container's upper and work directories round-trip through
-// its rootfs-rw tar; a host-merged container beside it ships only its upper.
+// A guest-merged container's upper and work directories travel together,
+// under the rw tar, and come back as they were; the host-merged container
+// beside it keeps its own format.
 func TestRootfsRWRoundTrip(t *testing.T) {
 	files := map[string]string{
 		"web/fs/etc/resolv.conf":           "nameserver 10.0.0.1",
@@ -320,9 +324,10 @@ func TestCheckEROFSLayerBudget(t *testing.T) {
 	}
 }
 
-// checkpointContainers reads each container's mode from the share: an rw bind
-// is guest-merged, a rootfs bind host-merged. A container with neither bind,
-// or with an rw bind and a bundle that names no EROFS layers, is an error.
+// The checkpoint records the mode the guest runs with, read from the share:
+// an rw bind means guest-merged, a rootfs bind host-merged. A guest on layer
+// images whose bundle lost them, or a container with neither bind, is an
+// error, not a guess.
 func TestCheckpointContainersModes(t *testing.T) {
 	pool := t.TempDir()
 	layer := fakeEROFSLayer(t, pool, "base", "sha256:bbb")

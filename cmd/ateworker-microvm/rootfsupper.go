@@ -128,6 +128,13 @@ func resetRootfsUpperDir(actorDirs *ateworkerpb.ActorDirs) error {
 func tarRootfsUpper(ctx context.Context, dir, checkpointDir string, ctrs []actorContainer) error {
 	for _, c := range ctrs {
 		upper, _ := kata.UpperWorkDirs(dir, c.name)
+		if c.erofs {
+			if ok, err := linkUpperDisk(ctx, dir, checkpointDir, c.name); err != nil {
+				return err
+			} else if ok {
+				continue
+			}
+		}
 		name, err := rootfsUpperTarFile(c.name, c.erofs)
 		if err != nil {
 			return err
@@ -162,6 +169,13 @@ func untarRootfsUpper(dir, snapshotDir string, containers []string, rec *erofsLa
 		upper, _, err := kata.MkdirUpperWorkDirs(dir, cName)
 		if err != nil {
 			return fmt.Errorf("while creating rootfs upper for %q: %w", cName, err)
+		}
+		if rec.isEROFS(cName) {
+			if ok, err := restoreUpperDisk(context.Background(), dir, snapshotDir, cName); err != nil {
+				return fmt.Errorf("while restoring the upper disk of %q: %w", cName, err)
+			} else if ok {
+				continue
+			}
 		}
 		name, err := rootfsUpperTarFile(cName, rec.isEROFS(cName))
 		if err != nil {

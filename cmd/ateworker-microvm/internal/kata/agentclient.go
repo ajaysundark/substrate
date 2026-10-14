@@ -146,6 +146,26 @@ func (a *AgentClient) CreateContainer(ctx context.Context, req *agentpb.CreateCo
 	return nil
 }
 
+// RemoveContainer kills the container's processes and unmounts the storages
+// it brought, its rootfs overlay among them. Mirrors
+// grpc.AgentService/RemoveContainer.
+func (a *AgentClient) RemoveContainer(ctx context.Context, containerID string) error {
+	req := &agentpb.RemoveContainerRequest{ContainerId: containerID}
+	if err := a.client.Call(ctx, "grpc.AgentService", "RemoveContainer", req, &emptypb.Empty{}); err != nil {
+		return fmt.Errorf("agent RemoveContainer: %w", err)
+	}
+	return nil
+}
+
+// DestroySandbox tears the sandbox down and unmounts its storages. Mirrors
+// grpc.AgentService/DestroySandbox.
+func (a *AgentClient) DestroySandbox(ctx context.Context) error {
+	if err := a.client.Call(ctx, "grpc.AgentService", "DestroySandbox", &agentpb.DestroySandboxRequest{}, &emptypb.Empty{}); err != nil {
+		return fmt.Errorf("agent DestroySandbox: %w", err)
+	}
+	return nil
+}
+
 // ReseedRandomDev feeds fresh entropy into the guest's random device: the agent
 // writes data into /dev/random and reseeds the kernel CRNG. This is how a restored
 // or cloned guest diverges from the entropy state frozen in its snapshot. Mirrors
