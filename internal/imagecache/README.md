@@ -58,7 +58,7 @@ anywhere.
 
 ```
 <cache-root>/                        default: /var/lib/ate/image-cache
-  version                            layout version marker ("2")
+  version                            layout version marker ("1")
   layers/sha256/<diffid-hex>/
       fs/                            the unpacked layer tree (for consumers
                                      asking Form{}), and/or
@@ -97,11 +97,10 @@ layer diffIDs in order — layers shared by N images exist once.
    present, return with no network I/O. Missing layers (only) are re-pulled.
 3. **Pull** by resolved digest: layers download in parallel (bounded at 4),
    each streamed download → decompress → untar directly into the pool.
-   Concurrent pulls of the same image share one singleflight, and so do
-   concurrent unpacks of the same layer blob. A layer's flight is keyed by
-   its blob digest and its diffID, so one image's bad blob cannot fail
-   another image's pull of the same diffID. Each completed layer lands on
-   its own, so an interrupted pull makes progress across retries.
+   Concurrent pulls of the same image or layer are collapsed with
+   singleflight, so simultaneous actor starts never duplicate work — and
+   each completed layer lands individually, so an interrupted pull makes
+   incremental progress across retries.
 4. **Unpack** (`unpackLayer`) is the repo's hardened untar: `os.Root`
    confinement (path traversal and symlink/hardlink escapes are refused),
    "later entry wins" within a layer, read-only-dir handling that works
@@ -112,49 +111,48 @@ layer diffIDs in order — layers shared by N images exist once.
    into the tree — overlayfs whiteouts are char devices atelet cannot
    create — they are recorded in `whiteouts.json` for the consumer to
    materialize.
-5. **Verify** before the layer enters the pool. Images share layers by
-   diffID, but each image's author chooses the diffIDs in its config. So
-   the uncompressed stream is hashed as it unpacks and must match the
-   claimed diffID. The stream is also read to EOF, because
-   go-containerregistry checks the blob against the manifest digest only
-   at EOF. On a mismatch the `.tmp-*` tree is discarded and the pull fails.
-
-   A layer already in the pool is reused without re-hashing, because it
-   was checked when it was written. The reusing image's own blob is never
-   downloaded, so it is never checked. atelet refuses a layout version 1
-   pool, whose layers may not have been checked.
-6. **Record**: the image config + diffID list is written under the
+5. **Record**: the image config + diffID list is written under the
    requested digest (and the per-platform child digest for multi-arch refs).
 
-The consumer picks the layer form with `Store.EnsureImageAs`. `Form{}` is
-the `fs/` tree above. `Form{EROFS: true}` builds a reproducible, 2 MiB-aligned
-`layer.erofs` (4 KiB blocks, uncompressed, for a guest to mount over
-virtio-pmem with DAX) and its `layer.erofs.sha256` digest from the layer tar
-with `buildLayerEROFS` (`github.com/erofs/go-erofs`). Whiteouts, opaque
-markers, ownership, modes, mtimes and xattrs go into the image, so the build
-needs no privilege. atelet only uses images it built itself, never one from
-an image, template or request. `Image.EROFS` and `OverlaySpec.EROFS` report
-the form delivered.
+The consumer picks the layer form (`Store.EnsureImageAs` with a `Form`).
+`Form{}` is the `fs/` tree above. `Form{EROFS: true}` makes unpack write a
+reproducible, 2 MiB-aligned `layer.erofs` (4 KiB blocks, uncompressed, for a
+guest to mount over virtio-pmem with DAX) and its `layer.erofs.sha256` digest
+via `buildLayerEROFS` (`github.com/erofs/go-erofs`) instead. Whiteouts,
+opaque markers, ownership, modes, mtimes, and non-overlay xattrs are written
+directly into the EROFS image, so the build needs no privilege. The image is
+built from the layer tar by atelet and never taken from an image, template or
+request. `Image.EROFS` and `OverlaySpec.EROFS` report the form delivered.
 
-A layer is stored in the form it was first pulled in. A pull in the other
-form downloads the layer blob again and builds the missing form in the same
-layer directory, under the same per-layer flight (`addLayerEROFS`,
-`addLayerFS`). The second form needs the blob because the unprivileged
-`fs/` unpack drops ownership, setuid bits, mtimes and xattrs that the image
-keeps. Adding `fs/` to an EROFS layer rewrites `whiteouts.json`, since the
-image build records only implicit directories.
+Micro-VM actors pull EROFS, gVisor actors pull `fs/`. A layer is stored in
+the form it was first pulled in; when a pull asks for the other form, the
+store downloads that layer's blob once more and builds the missing form
+beside the present one (`addLayerEROFS`, `addLayerFS`), in the same layer
+directory and under the same per-layer flight. A node that runs both sandbox
+classes ends up with both forms for the layers the two share and one form
+for the rest; nothing is converted up front, and nothing is removed. The
+`fs/` tree cannot stand in for the blob (the unprivileged unpack drops
+ownership, setuid bits, mtimes and xattrs the EROFS image keeps), which is
+why the second form costs a download. Adding `fs/` to an EROFS layer rewrites
+`whiteouts.json` from the unpack: the image build records implicit
+directories only, since whiteouts and opaque markers live inside the image.
 
-The bytes of `layer.erofs` are part of a snapshot's contract. A restored
-guest maps the image by offset (DAX), so a consumer that keeps a memory
-snapshot must record the image digest and refuse to restore over a layer
-whose digest differs. The digest depends on the layer's diffID and on the
-`go-erofs` version that built it. Treat a `go-erofs` bump that changes the
-image layout as a snapshot format change: snapshots taken before it cannot
-be restored on a node that rebuilds the layer.
+The bytes of `layer.erofs` are part of a snapshot's contract. A consumer
+that records the digest next to a memory snapshot (the micro-VM worker does,
+in `erofs-layers.json`) refuses to restore it over a layer whose digest
+differs, because the restored guest maps the image by offset (DAX), so a
+different layout under it would corrupt the processes it resumes.
+The digest is a function of the layer's diffID and of the `go-erofs` version
+that built it, so bumping `go-erofs` to a release that changes the image
+layout makes every existing memory snapshot unrestorable on a node that
+rebuilds the layer (a wiped cache or a node that joins later). Treat a
+`go-erofs` bump as a snapshot format change: pin it deliberately, and expect
+golden snapshots to be regenerated after one.
 
-`go-erofs` holds the whole tree in memory until `Close`. Up to
-`layerPullConcurrency` layers build at once and atelet runs without a memory
-limit, so size the node's memory reservation for the largest layers.
+`go-erofs` holds the whole tree in memory until `Close`: about 1 KiB of heap
+per entry (86 MiB at 100k entries, 279 MiB at 300k). Up to
+`layerPullConcurrency` layers build at once, and atelet runs without a memory
+limit, so size the node's reservation for that.
 
 `prepareOCIDirectory` in atelet then writes `rootfs-overlay.json`
 (`OverlaySpec`) into the bundle, listing the layer
@@ -206,21 +204,24 @@ rootfs with ExtraDirs and no mount.
 Actor semantics are unchanged from the untar era: the upper is wiped by
 atelet's `resetActorDirs` between runs, so every run still starts from a
 bit-exact, pristine image rootfs — it just costs a mount instead of an
-extraction. The micro-VM worker mounts nothing on the host: it attaches the
-bundle's EROFS layer images as virtio-pmem devices and the guest mounts the
-overlay over an upper from `PrepareEROFSUpper` (below).
+extraction. The micro-VM worker does not mount the bundle rootfs at all: it
+attaches the bundle's EROFS layer images as virtio-pmem devices and the guest
+mounts the overlay (see `PrepareEROFSUpper` below for the upper it prepares).
 
 ## Merged view without a host mount (`PrepareEROFSUpper`)
 
 A consumer that mounts `layer.erofs` images itself has no host-side merged
-tree to write into before its first mount. `PrepareEROFSUpper` resolves
-paths through the images with overlayfs lookup rules and creates in the
-fresh upper the directories the host writes into (such as `etc` for
-`resolv.conf`) and the implicit-parent repairs, so a directory like `/tmp`
-keeps its declared mode. Each gets the merged view's owner, mode, mtime and
-`user.*` / `security.capability` xattrs. `SetupBundleImageVolumes` composes
-only a bundle's image volumes. `SetupBundleRootfs` refuses a bundle on EROFS
-images.
+tree to write into before its first mount, yet two things must land in its
+fresh upper: the directories the host writes into (such as `etc` for
+`resolv.conf`) and the implicit-parent repairs that would otherwise leave a
+directory like `/tmp` at a fabricated 0755. `PrepareEROFSUpper(upper, spec,
+need)` resolves paths through the images with overlayfs lookup rules
+(whiteouts, opaque directories and shadowing non-directories honored) and
+creates those directories in the upper with the merged view's owner, mode,
+mtime and `user.*` / `security.capability` xattrs. `SetupBundleRootfs`
+refuses a bundle on EROFS images: the host does not mount them here, and an
+EROFS bundle's image volumes (`ImageVolumeOverlay.EROFS`) are the guest's to
+mount too.
 
 **Teardown**: `UnmountAllUnder(bundleDir)` lazily detaches every mount below
 an actor's bundle directory (via `/proc/self/mountinfo`) before atelet wipes
@@ -274,10 +275,9 @@ percentage as `df` reports it.
    (after a freshness re-check under the same lock the cache-hit path
    holds), then retire each layer the removal left unreferenced. If any
    layer must be kept — still referenced by another record, rooted by a
-   spec, pinned by an in-flight pull, younger than min-age, or its
-   retirement failed — the record is restored byte-exact and the image
-   simply is not evicted this pass: a layer is never left on disk without
-   a record explaining it.
+   spec, younger than min-age, or its retirement failed — the record is
+   restored byte-exact and the image simply is not evicted this pass: a
+   layer is never left on disk without a record explaining it.
 
 The pass reaches layers **only through records**: a layer is deleted
 exactly when its last referencing record goes, never by an independent
@@ -290,16 +290,14 @@ refcounts and roots computed from partial data would retire layers that
 unread records still reference or running actors still mount. Dry-run
 mutates nothing at all — not even the lazy size-file backfill.
 
-**In-flight pulls.** `EnsureImage` writes the image record **before**
-unpacking (the way Go allocates black during GC and containerd creates
-its ingest record before the bytes land), so every layer a pull produces
-is referenced — and kept fresh by a per-layer progress touch — from
-before it exists on disk. The pull also pins each of its layers until it
-returns, and eviction never retires a pinned layer, so a layer the pull
-has unpacked or reused cannot be taken from under it even if its record
-ages out meanwhile. An interrupted pull's record is resumable progress,
-not garbage: the next pull of that digest re-fetches only the missing
-layers, and a pull that never resumes ages out through ordinary LRU.
+**In-flight pulls need no separate protection.** `EnsureImage` writes
+the image record **before** unpacking (the way Go allocates black during
+GC and containerd creates its ingest record before the bytes land), so
+every layer a pull produces is referenced — and kept fresh by a
+per-layer progress touch — from before it exists on disk. An interrupted
+pull's record is resumable progress, not garbage: the next pull of that
+digest re-fetches only the missing layers, and a pull that never resumes
+ages out through ordinary LRU.
 
 **Startup recovery.** A layer no record references can only be crash
 debris (eviction interrupted between record-delete and layer-rename) or
@@ -310,16 +308,15 @@ fails to read. There is no online whole-pool scan (ext4's split: bounded
 recovery at mount, fsck offline).
 
 **Deletion is two-phase.** A layer is atomically renamed to `.rm-*`
-under the pin lock, and never while a pull has it pinned (a pull waits
-on eviction for at most one stat and one `rename(2)`), then removed
-asynchronously; a crash in between leaves the dir for the startup sweep.
-This matters because the kernel offers no protection here: deleting a
-directory that is a live overlay lowerdir in another mount namespace
-succeeds silently, leaves the overlay's behavior undefined, and doesn't
-even free the space until the mount goes away.
+inside the layer's singleflight (one `rename(2)` — eviction can never
+stall a pull), then removed asynchronously; a crash in between leaves
+the dir for the startup sweep. This matters because the kernel offers no
+protection here: deleting a directory that is a live overlay lowerdir in
+another mount namespace succeeds silently, leaves the overlay's behavior
+undefined, and doesn't even free the space until the mount goes away.
 
-Deleting the cache root by hand (while no actors are running on the node)
-remains safe — the store re-pulls whatever is missing.
+Deleting the cache root by hand (while no actors are starting) remains
+safe — the store re-pulls whatever is missing.
 
 This is Phase 2 of [#463](https://github.com/agent-substrate/substrate/issues/463);
 the watermark loop, flags, and cache metrics complete it. Phase 3 adds
