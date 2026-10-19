@@ -61,10 +61,10 @@ anywhere.
   version                            layout version marker ("1")
   layers/sha256/<diffid-hex>/
       fs/                            the unpacked layer tree (for consumers
-                                     asking Form{}), or
+                                     asking Form{}), and/or
       layer.erofs                    the layer as an EROFS image (for consumers
-                                     asking Form{EROFS: true}); a node holds
-                                     one form per layer
+                                     asking Form{EROFS: true}); a layer holds
+                                     the forms its consumers asked for
       layer.erofs.sha256             its digest, for a consumer to pin
       whiteouts.json                 whiteout and implicit-dir metadata
                                      recorded at unpack time
@@ -124,14 +124,18 @@ directly into the EROFS image, so the build needs no privilege. The image is
 built from the layer tar by atelet and never taken from an image, template or
 request. `Image.EROFS` and `OverlaySpec.EROFS` report the form delivered.
 
-A node's consumers use one form: micro-VM nodes pull EROFS, gVisor nodes pull
-`fs/`. The pool holds a layer in the form it was first pulled in, and a pull
-asking for the other form fails naming both; converting a node between forms
-means wiping its cache. Keep the two classes on separate node pools: taint
-micro-VM pools `ate.dev/sandboxClass=microvm:NoSchedule` (worker pools
-tolerate their own class, see `applySandboxClassToleration` in atecontroller).
-Two actors of different classes on one node fail on the first layer their
-images share.
+Micro-VM actors pull EROFS, gVisor actors pull `fs/`. A layer is stored in
+the form it was first pulled in; when a pull asks for the other form, the
+store downloads that layer's blob once more and builds the missing form
+beside the present one (`addLayerEROFS`, `addLayerFS`), in the same layer
+directory and under the same per-layer flight. A node that runs both sandbox
+classes ends up with both forms for the layers the two share and one form
+for the rest; nothing is converted up front, and nothing is removed. The
+`fs/` tree cannot stand in for the blob (the unprivileged unpack drops
+ownership, setuid bits, mtimes and xattrs the EROFS image keeps), which is
+why the second form costs a download. Adding `fs/` to an EROFS layer rewrites
+`whiteouts.json` from the unpack: the image build records implicit
+directories only, since whiteouts and opaque markers live inside the image.
 
 The bytes of `layer.erofs` are part of a snapshot's contract. A consumer
 that records the digest next to a memory snapshot (the micro-VM worker does,
