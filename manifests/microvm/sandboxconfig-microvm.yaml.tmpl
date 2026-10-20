@@ -76,3 +76,8 @@ spec:
         kata-image:
           url: "${BUCKET_SCHEME}://${ASSET_BUCKET_NAME}/kata-assets/rootfs.img"
           sha256: "96497f64da1de9c7473fef46c3d29ddd0805d334731cf9d903a21a5b2c33cefb"
+        # BENCH ONLY (rootfs-blk-feature): static e2fsprogs 1.47.1 mke2fs from
+        # hack/microvm-assets/bench/mke2fs-amd64; turns on upper disks.
+        mke2fs:
+          url: "${BUCKET_SCHEME}://${BUCKET_NAME}/kata-assets/mke2fs"
+          sha256: "adc336d7726ddd4af50bc3144be2926b377098433d648534f08ac51ca1aadf43"

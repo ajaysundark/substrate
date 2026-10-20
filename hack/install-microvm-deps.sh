@@ -204,6 +204,13 @@ else
   log "Assets already present in ${OUT}; skipping assemble."
 fi
 
+# BENCH ONLY (rootfs-blk-feature): ship the static mke2fs so EROFS containers
+# keep their rootfs upper on a virtio-blk disk (cmd/ateworker-microvm/rootfsdisk.go).
+if [[ "${ARCH}" == "amd64" ]]; then
+  cp hack/microvm-assets/bench/mke2fs-amd64 "${OUT}/mke2fs"
+  chmod +x "${OUT}/mke2fs"
+fi
+
 # --- 2. stage assets to rustfs (kind) / GCS (GKE) --------------------------
 # Upload the four assets under kata-assets/, where atelet fetches them: the
 # in-cluster rustfs (S3 API) on kind, or the GCS asset bucket on GKE.

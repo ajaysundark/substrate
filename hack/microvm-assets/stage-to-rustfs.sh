@@ -52,6 +52,8 @@ KIND_CLUSTER_NAME="${KIND_CLUSTER_NAME:-kind}"
 AWS_CLI_IMAGE="amazon/aws-cli:2.17.0@sha256:643507c10ada7964ca6157b3d799f030b90577643da9955d319a77399ed80d73"
 
 ASSETS=(cloud-hypervisor virtiofsd vmlinux rootfs.img)
+# BENCH ONLY: the optional mke2fs asset, when install-microvm-deps.sh put one in OUT.
+[[ -f "${OUT}/mke2fs" ]] && ASSETS+=(mke2fs)
 
 run_kubectl() {
   kubectl ${KUBECTL_CONTEXT:+--context="${KUBECTL_CONTEXT}"} -n "${NAMESPACE}" "$@"
