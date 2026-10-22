@@ -30,6 +30,7 @@ import (
 
 	"go.ate.dev/substrate/cmd/ateworker-microvm/internal/ch"
 	"go.ate.dev/substrate/cmd/ateworker-microvm/internal/kata"
+	"go.ate.dev/substrate/cmd/ateworker-microvm/internal/thinupper"
 	"go.ate.dev/substrate/internal/ateworker/phaselog"
 	"go.ate.dev/substrate/internal/ateworkervalidation"
 	"go.ate.dev/substrate/internal/imagecache"
@@ -89,6 +90,7 @@ func (s *AteWorkerService) CheckpointWorkload(ctx context.Context, req *ateworke
 	// independent observations rather than a partition of the total.
 	tStart := time.Now()
 	var dPrep, dPause, dSnapshot, dDurable, dUpper, dTeardown time.Duration
+	var dUpperSnap, dUpperExport, dUpperTeardown time.Duration
 	attribution := workerstats.ActorAttributionFromRequest(req)
 	scope := req.GetFidelity()
 	defer func() {
@@ -99,6 +101,9 @@ func (s *AteWorkerService) CheckpointWorkload(ctx context.Context, req *ateworke
 				{Name: phaseSnapshot, D: dSnapshot},
 				{Name: phaseDurableDir, D: dDurable},
 				{Name: phaseRootfsUpper, D: dUpper},
+				{Name: phaseUpperSnap, D: dUpperSnap},
+				{Name: phaseUpperExport, D: dUpperExport},
+				{Name: phaseUpperTeardown, D: dUpperTeardown},
 				{Name: phaseTeardown, D: dTeardown},
 				{Name: phaseTotal, D: time.Since(tStart)},
 			})
@@ -222,7 +227,23 @@ func (s *AteWorkerService) CheckpointWorkload(ctx context.Context, req *ateworke
 			return err
 		})
 	}
-	if shipsRootfs {
+	// With a thin upper the paused capture is a thin snapshot of the
+	// frozen upper; its tar is taken from the snapshot after the guest is
+	// torn down (exportThinUpper, below).
+	var frozen *thinupper.Frozen
+	if shipsRootfs && s.thin != nil {
+		g.Go(func() error {
+			t := time.Now()
+			f, err := s.thin.Snapshot(gctx, rootfsUpperDir(actorDirs))
+			dUpper = time.Since(t)
+			dUpperSnap = dUpper
+			if err == nil {
+				frozen = &f
+			}
+			return err
+		})
+		g.Go(func() error { return writeEROFSLayers(checkpointDir, ctrs) })
+	} else if shipsRootfs {
 		g.Go(func() error {
 			t := time.Now()
 			err := tarRootfsUpper(gctx, rootfsUpperDir(actorDirs), checkpointDir, ctrs)
@@ -234,28 +255,56 @@ func (s *AteWorkerService) CheckpointWorkload(ctx context.Context, req *ateworke
 		g.Go(func() error { return writeEROFSLayers(checkpointDir, ctrs) })
 	}
 	if err := g.Wait(); err != nil {
+		if frozen != nil {
+			s.thin.Discard(ctx, *frozen)
+		}
 		return nil, err
+	}
+
+	// A thin upper's tar is written from the snapshot while the guest is
+	// torn down, and joined before the files are listed.
+	var exportDone chan error
+	if frozen != nil {
+		exportDone = make(chan error, 1)
+		go func() {
+			t := time.Now()
+			err := exportThinUpper(ctx, s.thin, *frozen, checkpointDir, ctrs)
+			dUpperExport = time.Since(t)
+			exportDone <- err
+		}()
 	}
 
 	// Report exactly the files we wrote so atelet ships precisely this snapshot:
 	// for MEMORY, the CH snapshot (config.json + state.json + memory-ranges +
 	// base-id) plus the upper and durable-dir tars; for ROOTFS, the upper and
 	// durable-dir tars; for VOLUMES, the durable-dir tars alone.
-	snapshotFiles, err := listFiles(checkpointDir)
-	if err != nil {
-		return nil, fmt.Errorf("while listing snapshot files: %w", err)
+	var snapshotFiles []string
+	if exportDone == nil {
+		var err error
+		if snapshotFiles, err = listFiles(checkpointDir); err != nil {
+			return nil, fmt.Errorf("while listing snapshot files: %w", err)
+		}
 	}
 
 	// Tear down: the actor returns to "available". Best-effort; the snapshot is
 	// already on disk for atelet to ship.
 	tTeardown := time.Now()
-	if err := s.terminateWorkload(ctx, attribution, actorDirs); err != nil {
+	if err := s.terminateWorkload(context.WithValue(ctx, upperTeardownKey{}, &dUpperTeardown), attribution, actorDirs); err != nil {
 		slog.WarnContext(ctx, "failed to terminate workload after checkpoint",
 			slog.String("actor", attribution.Ref.String()),
 			slog.String("actorUID", actorUID),
 			slog.Any("err", err))
 	}
 	dTeardown = time.Since(tTeardown)
+	if exportDone != nil {
+		if err := <-exportDone; err != nil {
+			return nil, fmt.Errorf("while exporting thin rootfs upper: %w", err)
+		}
+		var err error
+		if snapshotFiles, err = listFiles(checkpointDir); err != nil {
+			return nil, fmt.Errorf("while listing snapshot files: %w", err)
+		}
+	}
 
 	s.actorLogger.EmitLifecycleLog(ctx, "Actor checkpointed", attribution)
 	slog.InfoContext(ctx, "Actor checkpointed", slog.String("id", actorUID), slog.Any("snapshot_files", snapshotFiles),
@@ -395,7 +444,11 @@ func (s *AteWorkerService) teardownActor(ctx context.Context, id string, actorDi
 	// Remove the rootfs upper dir: ateworker owns it — atelet's actor-dir reset
 	// doesn't know it — and its absence is what marks a worker as holding no
 	// disk-backed upper. Runs after the checkpoint tar, which is already on disk.
-	if err := os.RemoveAll(rootfsUpperDir(actorDirs)); err != nil {
+	d, err := removeRootfsUpper(ctx, s.thin, rootfsUpperDir(actorDirs))
+	if p, ok := ctx.Value(upperTeardownKey{}).(*time.Duration); ok {
+		*p = d
+	}
+	if err != nil {
 		slog.WarnContext(ctx, "Failed to remove rootfs upper dir", slog.String("actorUID", id), slog.Any("err", err))
 	}
 
@@ -408,6 +461,10 @@ func (s *AteWorkerService) teardownActor(ctx context.Context, id string, actorDi
 	}
 	return errors.Join(errs...)
 }
+
+// upperTeardownKey carries a *time.Duration through terminateWorkload for the
+// checkpoint record's upper_teardown phase.
+type upperTeardownKey struct{}
 
 // TerminateWorkload stops the running actor, tears down its VMM, and cleans up
 // networking and overlays.

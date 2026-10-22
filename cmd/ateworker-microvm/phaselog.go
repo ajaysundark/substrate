@@ -44,5 +44,17 @@ const (
 	phaseResume      = "resume"
 	phaseWakeupProbe = "wakeup_probe"
 
+	// Thin rootfs upper (internal/thinupper), recorded only when it is on.
+	// upper_snap is the create_snap (with suspend and resume on checkpoint),
+	// upper_export the tar from the snapshot after the guest is gone,
+	// upper_golden a restore's golden volume build on a miss, upper_mount
+	// activating and mounting the actor's volume, upper_teardown its
+	// unmount and delete.
+	phaseUpperSnap     = "upper_snap"
+	phaseUpperExport   = "upper_export"
+	phaseUpperGolden   = "upper_golden"
+	phaseUpperMount    = "upper_mount"
+	phaseUpperTeardown = "upper_teardown"
+
 	phaseTotal = ateattr.SnapshotPhaseTotal
 )

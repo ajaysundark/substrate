@@ -473,7 +473,14 @@ func (s *AteWorkerService) coldBootActor(ctx context.Context, p actorBootParams)
 	upperDone := make(chan error, 1)
 	upperJoined := false
 	go func() {
-		upperDone <- stageRootfsUpper(p.actorDirs, p.rootfsUpperSnapshotDir, containerNames(containers), erofsRec)
+		tm, err := stageRootfsUpper(ctx, s.thin, p.actorDirs, p.rootfsUpperSnapshotDir, containerNames(containers), erofsRec)
+		if err == nil && s.thin != nil {
+			slog.InfoContext(ctx, "Thin rootfs upper staged", slog.String("id", p.actorUID),
+				slog.Bool("restore", p.rootfsUpperSnapshotDir != ""), slog.Bool("golden_hit", tm.GoldenHit),
+				slog.Duration("teardown", tm.Teardown), slog.Duration("golden", tm.Golden),
+				slog.Duration("snap", tm.Snap), slog.Duration("mount", tm.Mount))
+		}
+		upperDone <- err
 	}()
 	defer func() {
 		if !upperJoined {

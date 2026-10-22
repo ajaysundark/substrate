@@ -52,12 +52,17 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"go.ate.dev/substrate/cmd/ateworker-microvm/internal/kata"
+	"go.ate.dev/substrate/cmd/ateworker-microvm/internal/thinupper"
 	"go.ate.dev/substrate/internal/proto/ateworkerpb"
 	"go.ate.dev/substrate/internal/tarutil"
 )
@@ -95,12 +100,81 @@ func containerNames(containers []*ateworkerpb.Container) []string {
 // snapshotDir is empty, otherwise re-materialized from the per-container tars
 // a ROOTFS or MEMORY snapshot left in snapshotDir. Either way any previous
 // activation's contents are gone first. Must run after CleanupSandboxState
-// has dropped the overlay mounts that used the dir.
-func stageRootfsUpper(actorDirs *ateworkerpb.ActorDirs, snapshotDir string, containers []string, rec *erofsLayers) error {
-	if snapshotDir == "" {
-		return resetRootfsUpperDir(actorDirs)
+// has dropped the overlay mounts that used the dir. With a thin upper
+// (internal/thinupper) the dir is a mounted thin volume instead.
+func stageRootfsUpper(ctx context.Context, thin *thinupper.Manager, actorDirs *ateworkerpb.ActorDirs, snapshotDir string, containers []string, rec *erofsLayers) (thinupper.Timings, error) {
+	if thin != nil {
+		if snapshotDir == "" {
+			return thin.ColdBoot(ctx, rootfsUpperDir(actorDirs))
+		}
+		return restoreThinUpper(ctx, thin, rootfsUpperDir(actorDirs), snapshotDir, containers, rec)
 	}
-	return untarRootfsUpper(rootfsUpperDir(actorDirs), snapshotDir, containers, rec)
+	if snapshotDir == "" {
+		return thinupper.Timings{}, resetRootfsUpperDir(actorDirs)
+	}
+	return thinupper.Timings{}, untarRootfsUpper(rootfsUpperDir(actorDirs), snapshotDir, containers, rec)
+}
+
+// restoreRootfsUpper re-materializes the uppers from the snapshot's tars:
+// untarred into a fresh directory, or with a thin upper, snapshotted from the
+// golden volume holding those tars.
+func restoreRootfsUpper(ctx context.Context, thin *thinupper.Manager, dir, snapshotDir string, containers []string, rec *erofsLayers) (thinupper.Timings, error) {
+	if thin != nil {
+		return restoreThinUpper(ctx, thin, dir, snapshotDir, containers, rec)
+	}
+	return thinupper.Timings{}, untarRootfsUpper(dir, snapshotDir, containers, rec)
+}
+
+// restoreThinUpper gives dir a thin volume holding the snapshot's uppers. The
+// golden volume is keyed by the tars' content, so every restore of the same
+// snapshot on this node (golden fan-out, or a resume of a snapshot this node
+// took, see checkpointThinUpper) shares one untar.
+func restoreThinUpper(ctx context.Context, thin *thinupper.Manager, dir, snapshotDir string, containers []string, rec *erofsLayers) (thinupper.Timings, error) {
+	key, err := rootfsUpperKey(snapshotDir, containers, rec.isEROFS)
+	if err != nil {
+		return thinupper.Timings{}, err
+	}
+	return thin.Restore(ctx, dir, key, func(root string) error {
+		return extractRootfsUpper(root, snapshotDir, containers, rec)
+	})
+}
+
+// rootfsUpperKey hashes the snapshot's upper tars, in container order, into
+// the key of the golden volume holding them.
+func rootfsUpperKey(snapshotDir string, containers []string, erofs func(string) bool) (string, error) {
+	h := sha256.New()
+	for _, cName := range containers {
+		name, err := rootfsUpperTarFile(cName, erofs(cName))
+		if err != nil {
+			return "", err
+		}
+		f, err := os.Open(filepath.Join(snapshotDir, name))
+		if err != nil {
+			return "", fmt.Errorf("while hashing rootfs upper tar: %w", err)
+		}
+		th := sha256.New()
+		_, err = io.Copy(th, f)
+		f.Close()
+		if err != nil {
+			return "", fmt.Errorf("while hashing rootfs upper tar: %w", err)
+		}
+		fmt.Fprintf(h, "%s\x00%x\n", name, th.Sum(nil))
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// removeRootfsUpper removes the actor's upper at teardown: the thin volume
+// first when there is one, then the directory.
+func removeRootfsUpper(ctx context.Context, thin *thinupper.Manager, dir string) (time.Duration, error) {
+	var d time.Duration
+	if thin != nil {
+		start := time.Now()
+		if err := thin.Teardown(ctx, dir); err != nil {
+			return time.Since(start), err
+		}
+		d = time.Since(start)
+	}
+	return d, os.RemoveAll(dir)
 }
 
 // resetRootfsUpperDir gives a cold boot a pristine upper directory: a cold
@@ -158,6 +232,12 @@ func untarRootfsUpper(dir, snapshotDir string, containers []string, rec *erofsLa
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("while creating rootfs upper dir %q: %w", dir, err)
 	}
+	return extractRootfsUpper(dir, snapshotDir, containers, rec)
+}
+
+// extractRootfsUpper lays out each container's upper under dir and extracts
+// its tar there.
+func extractRootfsUpper(dir, snapshotDir string, containers []string, rec *erofsLayers) error {
 	for _, cName := range containers {
 		upper, _, err := kata.MkdirUpperWorkDirs(dir, cName)
 		if err != nil {
@@ -176,4 +256,22 @@ func untarRootfsUpper(dir, snapshotDir string, containers []string, rec *erofsLa
 		}
 	}
 	return nil
+}
+
+// exportThinUpper writes the checkpoint's upper tars from a thin snapshot of
+// the frozen upper, then keeps the snapshot as the golden volume for those
+// tars, so resuming this snapshot on this node needs no untar.
+func exportThinUpper(ctx context.Context, thin *thinupper.Manager, f thinupper.Frozen, checkpointDir string, ctrs []actorContainer) error {
+	names := make([]string, len(ctrs))
+	erofs := make(map[string]bool, len(ctrs))
+	for i, c := range ctrs {
+		names[i] = c.name
+		erofs[c.name] = c.erofs
+	}
+	return thin.Export(ctx, f, func(root string) (string, error) {
+		if err := tarRootfsUpper(ctx, root, checkpointDir, ctrs); err != nil {
+			return "", err
+		}
+		return rootfsUpperKey(checkpointDir, names, func(n string) bool { return erofs[n] })
+	})
 }

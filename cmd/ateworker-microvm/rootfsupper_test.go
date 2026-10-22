@@ -119,7 +119,7 @@ func TestStageRootfsUpper(t *testing.T) {
 		if err := os.Rename(stale, rootfsUpperDir(dirs)); err != nil {
 			t.Fatal(err)
 		}
-		if err := stageRootfsUpper(dirs, "", containers, noEROFS); err != nil {
+		if _, err := stageRootfsUpper(t.Context(), nil, dirs, "", containers, noEROFS); err != nil {
 			t.Fatalf("stageRootfsUpper: %v", err)
 		}
 		entries, err := os.ReadDir(rootfsUpperDir(dirs))
@@ -134,7 +134,7 @@ func TestStageRootfsUpper(t *testing.T) {
 		if err := os.Rename(stale, rootfsUpperDir(dirs)); err != nil {
 			t.Fatal(err)
 		}
-		if err := stageRootfsUpper(dirs, snapshotDir, containers, noEROFS); err != nil {
+		if _, err := stageRootfsUpper(t.Context(), nil, dirs, snapshotDir, containers, noEROFS); err != nil {
 			t.Fatalf("stageRootfsUpper: %v", err)
 		}
 		got, err := os.ReadFile(filepath.Join(rootfsUpperDir(dirs), "app_ovl/fs/home/agent/notes.txt"))
@@ -216,5 +216,38 @@ func TestRootfsUpperTarFileRejectsBadNames(t *testing.T) {
 func TestUntarRootfsUpperMissingTar(t *testing.T) {
 	if err := untarRootfsUpper(t.TempDir(), t.TempDir(), []string{"app"}, noEROFS); err == nil {
 		t.Error("untarRootfsUpper with no tar = nil error, want one")
+	}
+}
+
+func TestRootfsUpperKey(t *testing.T) {
+	// The key a checkpoint registers its thin snapshot under must be the
+	// key a later restore of the same tars computes.
+	src := upperDirWith(t, map[string]string{"app/fs/a.txt": "one", "app/work/x": ""})
+	ctrs := []actorContainer{{name: "app", erofs: true}}
+	ckpt := t.TempDir()
+	if err := tarRootfsUpper(t.Context(), src, ckpt, ctrs); err != nil {
+		t.Fatal(err)
+	}
+	isEROFS := func(string) bool { return true }
+	k1, err := rootfsUpperKey(ckpt, []string{"app"}, isEROFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k2, err := rootfsUpperKey(ckpt, []string{"app"}, isEROFS)
+	if err != nil || k1 != k2 || len(k1) != 64 {
+		t.Fatalf("keys %q, %q, err %v", k1, k2, err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "app/fs/a.txt"), []byte("two"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ckpt2 := t.TempDir()
+	if err := tarRootfsUpper(t.Context(), src, ckpt2, ctrs); err != nil {
+		t.Fatal(err)
+	}
+	if k3, err := rootfsUpperKey(ckpt2, []string{"app"}, isEROFS); err != nil || k3 == k1 {
+		t.Errorf("changed upper kept key %q (err %v)", k3, err)
+	}
+	if _, err := rootfsUpperKey(ckpt, []string{"app"}, func(string) bool { return false }); err == nil {
+		t.Error("key over a missing host-merged tar succeeded")
 	}
 }

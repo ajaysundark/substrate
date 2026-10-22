@@ -36,6 +36,7 @@ import (
 
 	"go.ate.dev/substrate/cmd/ateworker-microvm/internal/ch"
 	"go.ate.dev/substrate/cmd/ateworker-microvm/internal/kata"
+	"go.ate.dev/substrate/cmd/ateworker-microvm/internal/thinupper"
 	"go.ate.dev/substrate/internal/ateworkervalidation"
 	"go.ate.dev/substrate/internal/imagecache"
 	"go.ate.dev/substrate/internal/proto/ateworkerpb"
@@ -313,8 +314,13 @@ func (s *AteWorkerService) restoreMemoryFidelity(ctx context.Context, p actorBoo
 	// a retried restore's own untar race it inside the same directory.
 	untarDone := make(chan error, 1)
 	untarJoined := false
+	// thinT is written by the goroutine before it sends on untarDone, so it
+	// is safe to read after the join.
+	var thinT thinupper.Timings
 	go func() {
-		untarDone <- untarRootfsUpper(rootfsUpperDir(p.actorDirs), restoreDir, containerNames(p.containers), erofsRec)
+		var err error
+		thinT, err = restoreRootfsUpper(ctx, s.thin, rootfsUpperDir(p.actorDirs), restoreDir, containerNames(p.containers), erofsRec)
+		untarDone <- err
 	}()
 	defer func() {
 		if !untarJoined {
@@ -516,6 +522,11 @@ func (s *AteWorkerService) restoreMemoryFidelity(ctx context.Context, p actorBoo
 			{Name: phaseVMRestore, D: tVMRestore.Sub(tLaunch)},
 			{Name: phaseResume, D: tResume.Sub(tVMRestore)},
 			{Name: phaseWakeupProbe, D: dWakeupProbe},
+			// The thin upper's own steps, inside the upper staging that
+			// overlaps bundles: not part of the partition above.
+			{Name: phaseUpperGolden, D: thinT.Golden},
+			{Name: phaseUpperSnap, D: thinT.Snap},
+			{Name: phaseUpperMount, D: thinT.Mount},
 			{Name: phaseTotal, D: dTotal},
 		})
 
