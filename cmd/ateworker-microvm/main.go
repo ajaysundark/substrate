@@ -88,6 +88,17 @@ var (
 const minUsageSampleInterval = 50 * time.Second
 
 func main() {
+	// BENCH ONLY: the privileged rootfs-thin helper shares this binary (see
+	// internal/thinupper/helper.go).
+	if len(os.Args) == 3 && os.Args[1] == "rootfs-thin-helper" {
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+		defer stop()
+		if err := thinupper.ServeHelper(ctx, os.Args[2], "/host"); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	pid1.RunIfPID1()
 	pflag.Parse()
 	if *showVersion {
