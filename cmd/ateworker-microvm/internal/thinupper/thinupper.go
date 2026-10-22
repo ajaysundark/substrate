@@ -442,7 +442,11 @@ func (m *Manager) Export(ctx context.Context, f Frozen, fn func(root string) (st
 	}
 	key, fnErr := fn(mnt)
 	if err := m.unmountAndRemove(ctx, f.id, mnt); err != nil {
-		return errors.Join(fnErr, err)
+		// The tar is already written; a snapshot that will not go
+		// inactive is only lost as a golden volume.
+		slog.WarnContext(ctx, "Thin snapshot stayed busy after export; not kept as golden", slog.Uint64("id", f.id), slog.Any("err", err))
+		m.deleteLater(f.id)
+		return fnErr
 	}
 	if fnErr != nil {
 		m.discard(ctx, f.id)
@@ -539,9 +543,61 @@ func (m *Manager) Teardown(ctx context.Context, dir string) error {
 		return nil
 	}
 	if err := m.unmountAndRemove(ctx, id, dir); err != nil {
+		m.deleteLater(id)
 		return err
 	}
-	return m.delete(ctx, id)
+	if err := m.delete(ctx, id); err != nil {
+		return err
+	}
+	m.reapPending(ctx)
+	return nil
+}
+
+// deleteLater queues id, whose device would not go inactive, for a later
+// delete (reapPending).
+func (m *Manager) deleteLater(id uint64) {
+	unlock, err := m.lock("lock", syscall.LOCK_EX)
+	if err != nil {
+		return
+	}
+	defer unlock()
+	f, err := os.OpenFile(filepath.Join(m.cfg.StateDir, "pending"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	fmt.Fprintln(f, id)
+	f.Close()
+}
+
+// reapPending removes and deletes queued ids whose holders have let go.
+func (m *Manager) reapPending(ctx context.Context) {
+	p := filepath.Join(m.cfg.StateDir, "pending")
+	unlock, err := m.lock("lock", syscall.LOCK_EX)
+	if err != nil {
+		return
+	}
+	b, err := os.ReadFile(p)
+	if err != nil || len(b) == 0 {
+		unlock()
+		return
+	}
+	_ = os.Remove(p)
+	unlock()
+	var keep []uint64
+	for _, f := range strings.Fields(string(b)) {
+		id, err := strconv.ParseUint(f, 10, 64)
+		if err != nil {
+			continue
+		}
+		n := q(m.name(id))
+		script := fmt.Sprintf("dmsetup --noudevsync info %s >/dev/null 2>&1 && { dmsetup --noudevsync remove %s || exit 1; }\ndmsetup --noudevsync message %s 0 'delete %d'", n, n, q(m.cfg.Pool), id)
+		if _, err := m.run.Run(ctx, script); err != nil {
+			keep = append(keep, id)
+		}
+	}
+	for _, id := range keep {
+		m.deleteLater(id)
+	}
 }
 
 // reset tears down any volume at dir and clears what is left of the dir.
@@ -639,10 +695,15 @@ func (m *Manager) activateCmd(id uint64, ro bool) string {
 }
 
 // removeCmd deactivates id, retrying while a just-closed opener (udev's
-// probe after mkfs, a lazy unmount) still holds it.
+// blkid probe after the last writer closes, a lazy unmount) still holds it:
+// 10 s of retries, then a deferred remove and up to 30 s more for it to
+// land. Under heavy node IO a udev probe can hold the device for seconds.
 func (m *Manager) removeCmd(id uint64) string {
 	n := q(m.name(id))
-	return fmt.Sprintf("for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do dmsetup --noudevsync remove %s 2>/dev/null && exit 0; sleep 0.05; done; dmsetup --noudevsync remove %s", n, n)
+	return fmt.Sprintf(`i=0; while [ $i -lt 100 ]; do dmsetup --noudevsync remove %s 2>/dev/null && exit 0; sleep 0.1; i=$((i+1)); done
+dmsetup --noudevsync remove --deferred %s 2>/dev/null
+i=0; while [ $i -lt 300 ]; do dmsetup --noudevsync info %s >/dev/null 2>&1 || exit 0; sleep 0.1; i=$((i+1)); done
+echo "thin device %s still busy" >&2; exit 1`, n, n, n, m.name(id))
 }
 
 func (m *Manager) name(id uint64) string { return m.cfg.Prefix + "-" + strconv.FormatUint(id, 10) }
