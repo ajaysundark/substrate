@@ -262,3 +262,28 @@ func TestUnescapeMountinfo(t *testing.T) {
 		t.Errorf("got %q", got)
 	}
 }
+
+func TestHelperRoundTrip(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("the helper chroots, which needs root")
+	}
+	sock := filepath.Join(t.TempDir(), "h.sock")
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go func() { _ = ServeHelper(ctx, sock, "/") }()
+	r := SocketRunner{Path: sock}
+	var out string
+	var err error
+	for i := 0; i < 50; i++ {
+		if out, err = r.Run(t.Context(), "echo hi"); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil || out != "hi\n" {
+		t.Fatalf("Run = %q, %v", out, err)
+	}
+	if _, err := r.Run(t.Context(), "echo oops >&2; exit 3"); err == nil || !strings.Contains(err.Error(), "oops") {
+		t.Errorf("failing script err = %v", err)
+	}
+}

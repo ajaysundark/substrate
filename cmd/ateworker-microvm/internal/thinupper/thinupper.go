@@ -78,6 +78,9 @@ type Config struct {
 	GoldenMax int
 	// MountOptions are the ext4 options for an actor's volume.
 	MountOptions string
+	// Helper is the socket of the BENCH ONLY privileged helper that runs
+	// the device commands (helper.go); empty runs them in the worker.
+	Helper string
 }
 
 // ParseConfig reads key=value lines; blank lines and # comments are skipped.
@@ -114,6 +117,8 @@ func ParseConfig(b []byte) (Config, error) {
 			c.GoldenMax, err = strconv.Atoi(v)
 		case "mount_options":
 			c.MountOptions = v
+		case "helper":
+			c.Helper = v
 		default:
 			return Config{}, fmt.Errorf("unknown key %q", k)
 		}
@@ -205,6 +210,9 @@ func Load(ctx context.Context, marker string, run Runner) (*Manager, error) {
 	cfg, err := ParseConfig(b)
 	if err != nil {
 		return nil, fmt.Errorf("while parsing %s: %w", marker, err)
+	}
+	if cfg.Helper != "" {
+		run = SocketRunner{Path: cfg.Helper}
 	}
 	return New(ctx, cfg, run)
 }

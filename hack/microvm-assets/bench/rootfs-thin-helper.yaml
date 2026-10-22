@@ -1,0 +1,40 @@
+# BENCH ONLY: privileged helper that runs the ateworker-microvm thin upper's
+# dmsetup and mount scripts on the host (cmd/ateworker-microvm/internal/thinupper/helper.go).
+# IMAGE is the ateworker-microvm image the worker pool runs. Point the marker at it with
+#   helper=/var/lib/ate/rootfs-thin.d/helper.sock
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rootfs-thin
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: rootfs-thin-helper
+  namespace: rootfs-thin
+spec:
+  selector:
+    matchLabels:
+      app: rootfs-thin-helper
+  template:
+    metadata:
+      labels:
+        app: rootfs-thin-helper
+    spec:
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: helper
+        image: IMAGE
+        command: ["/ko-app/ateworker-microvm", "rootfs-thin-helper", "/host/var/lib/ate/rootfs-thin.d/helper.sock"]
+        securityContext:
+          privileged: true
+          runAsUser: 0
+        volumeMounts:
+        - name: host
+          mountPath: /host
+          mountPropagation: Bidirectional
+      volumes:
+      - name: host
+        hostPath:
+          path: /
