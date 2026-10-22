@@ -38,6 +38,7 @@ import (
 
 	"cloud.google.com/go/compute/metadata"
 	"github.com/spf13/pflag"
+	"go.ate.dev/substrate/cmd/ateworker-microvm/internal/thinupper"
 	"go.ate.dev/substrate/internal/actorlock"
 	"go.ate.dev/substrate/internal/actorlog"
 	"go.ate.dev/substrate/internal/apierror"
@@ -235,6 +236,14 @@ func do(ctx context.Context) error {
 	}
 	ateworkerService := NewService(*podUID, *chBinary, *guestDebug, *vmmMemReserve, *maxActors, tunnel, actorLogger)
 	ateworkerService.actorCgroups = actorCgroups
+	thin, err := thinupper.Load(ctx, thinupper.MarkerFile, thinupper.ExecRunner{})
+	if err != nil {
+		return fmt.Errorf("while setting up thin rootfs uppers: %w", err)
+	}
+	if thin != nil {
+		slog.InfoContext(ctx, "Rootfs uppers on dm-thin volumes", slog.String("marker", thinupper.MarkerFile))
+	}
+	ateworkerService.thin = thin
 	// The controller sets both from the downward API.
 	pool := workerstats.Pool{Namespace: os.Getenv("POD_NAMESPACE"), Name: os.Getenv("WORKER_POOL_NAME")}
 	if pool.Namespace == "" || pool.Name == "" {
@@ -384,6 +393,9 @@ type AteWorkerService struct {
 	// actorCgroups is set when the worker's cgroup is delegated, so each actor's
 	// VMM and virtiofsd run in a leaf of their own.
 	actorCgroups bool
+	// thin puts rootfs uppers on dm-thin volumes; nil keeps plain
+	// directories (see rootfsupper.go and internal/thinupper).
+	thin *thinupper.Manager
 }
 
 var _ ateworkerpb.WorkerServer = (*AteWorkerService)(nil)
